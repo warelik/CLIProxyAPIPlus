@@ -77,8 +77,16 @@ func ConvertGeminiResponseToClaude(_ context.Context, _ string, originalRequestR
 		output = translatorcommon.AppendSSEEventString(output, event, payload, 3)
 	}
 	appendSignatureDelta := func(signature string) {
-		if signature == "" || (*param).(*Params).ResponseType != 2 {
+		if signature == "" {
 			return
+		}
+		if (*param).(*Params).ResponseType != 2 {
+			if (*param).(*Params).ResponseType != 0 {
+				appendEvent("content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, (*param).(*Params).ResponseIndex))
+				(*param).(*Params).ResponseIndex++
+			}
+			appendEvent("content_block_start", fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"thinking","thinking":""}}`, (*param).(*Params).ResponseIndex))
+			(*param).(*Params).ResponseType = 2
 		}
 		data, _ := sjson.SetBytes([]byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"signature_delta","signature":""}}`, (*param).(*Params).ResponseIndex)), "delta.signature", signature)
 		appendEvent("content_block_delta", string(data))
@@ -121,7 +129,7 @@ func ConvertGeminiResponseToClaude(_ context.Context, _ string, originalRequestR
 			}
 			hasThoughtSignature := thoughtSignatureResult.Exists() && thoughtSignatureResult.String() != ""
 
-			if hasThoughtSignature && !partTextResult.Exists() && !functionCallResult.Exists() {
+			if hasThoughtSignature && !functionCallResult.Exists() && (!partTextResult.Exists() || partTextResult.String() == "") {
 				appendSignatureDelta(thoughtSignatureResult.String())
 				continue
 			}
@@ -129,11 +137,7 @@ func ConvertGeminiResponseToClaude(_ context.Context, _ string, originalRequestR
 			// Handle text content (both regular content and thinking)
 			if partTextResult.Exists() {
 				// Process thinking content (internal reasoning)
-				if partResult.Get("thought").Bool() || hasThoughtSignature {
-					if hasThoughtSignature && partTextResult.String() == "" {
-						appendSignatureDelta(thoughtSignatureResult.String())
-						continue
-					}
+				if partResult.Get("thought").Bool() {
 					// Continue existing thinking block
 					if (*param).(*Params).ResponseType == 2 {
 						data, _ := sjson.SetBytes([]byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"thinking_delta","thinking":""}}`, (*param).(*Params).ResponseIndex)), "delta.thinking", partTextResult.String())
@@ -161,6 +165,9 @@ func ConvertGeminiResponseToClaude(_ context.Context, _ string, originalRequestR
 					}
 					appendSignatureDelta(thoughtSignatureResult.String())
 				} else {
+					if hasThoughtSignature {
+						appendSignatureDelta(thoughtSignatureResult.String())
+					}
 					// Process regular text content (user-visible output)
 					// Continue existing text block
 					if (*param).(*Params).ResponseType == 1 {

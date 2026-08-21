@@ -60,3 +60,23 @@ func TestConvertGeminiResponseToClaude_SignatureOnlyPartDoesNotOpenEmptyTextBloc
 		t.Fatalf("DONE chunk must still emit message_stop after final events: %s", outputText)
 	}
 }
+
+func TestConvertGeminiResponseToClaude_VisibleTextWithSignatureStaysVisible(t *testing.T) {
+	requestJSON := []byte(`{"model":"gemini-test","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+	chunk := []byte(`{"candidates":[{"content":{"parts":[{"text":"visible answer","thoughtSignature":"sig-visible"}]}}],"modelVersion":"gemini-test","responseId":"resp-test"}`)
+
+	var param any
+	ctx := context.Background()
+	output := bytes.Join(ConvertGeminiResponseToClaude(ctx, "gemini-test", requestJSON, requestJSON, chunk, &param), nil)
+	outputText := string(output)
+
+	if !strings.Contains(outputText, `"type":"text_delta"`) || !strings.Contains(outputText, `"text":"visible answer"`) {
+		t.Fatalf("visible text must stay a text delta: %s", outputText)
+	}
+	if strings.Contains(outputText, `"thinking":"visible answer"`) {
+		t.Fatalf("visible text must never be rerouted into a thinking block: %s", outputText)
+	}
+	if !strings.Contains(outputText, `"signature":"sig-visible"`) {
+		t.Fatalf("signature attached to a visible text part must still be forwarded: %s", outputText)
+	}
+}

@@ -76,6 +76,22 @@ func ConvertGeminiCLIResponseToClaude(_ context.Context, _ string, originalReque
 	appendEvent := func(event, payload string) {
 		output = translatorcommon.AppendSSEEventString(output, event, payload, 3)
 	}
+	appendSignatureDelta := func(signature string) {
+		if signature == "" {
+			return
+		}
+		if (*param).(*Params).ResponseType != 2 {
+			if (*param).(*Params).ResponseType != 0 {
+				appendEvent("content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, (*param).(*Params).ResponseIndex))
+				(*param).(*Params).ResponseIndex++
+			}
+			appendEvent("content_block_start", fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"thinking","thinking":""}}`, (*param).(*Params).ResponseIndex))
+			(*param).(*Params).ResponseType = 2
+		}
+		data, _ := sjson.SetBytes([]byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"signature_delta","signature":""}}`, (*param).(*Params).ResponseIndex)), "delta.signature", signature)
+		appendEvent("content_block_delta", string(data))
+		(*param).(*Params).HasContent = true
+	}
 
 	// Initialize the streaming session with a message_start event
 	// This is only sent for the very first response chunk to establish the streaming session
@@ -108,6 +124,17 @@ func ConvertGeminiCLIResponseToClaude(_ context.Context, _ string, originalReque
 			partTextResult := partResult.Get("text")
 			functionCallResult := partResult.Get("functionCall")
 
+			thoughtSignatureResult := partResult.Get("thoughtSignature")
+			if !thoughtSignatureResult.Exists() {
+				thoughtSignatureResult = partResult.Get("thought_signature")
+			}
+			hasThoughtSignature := thoughtSignatureResult.Exists() && thoughtSignatureResult.String() != ""
+
+			if hasThoughtSignature && !functionCallResult.Exists() && (!partTextResult.Exists() || partTextResult.String() == "") {
+				appendSignatureDelta(thoughtSignatureResult.String())
+				continue
+			}
+
 			// Handle text content (both regular content and thinking)
 			if partTextResult.Exists() {
 				// Process thinking content (internal reasoning)
@@ -137,7 +164,11 @@ func ConvertGeminiCLIResponseToClaude(_ context.Context, _ string, originalReque
 						(*param).(*Params).ResponseType = 2 // Set state to thinking
 						(*param).(*Params).HasContent = true
 					}
+					appendSignatureDelta(thoughtSignatureResult.String())
 				} else {
+					if hasThoughtSignature {
+						appendSignatureDelta(thoughtSignatureResult.String())
+					}
 					// Process regular text content (user-visible output)
 					// Continue existing text block if already in content state
 					if (*param).(*Params).ResponseType == 1 {
