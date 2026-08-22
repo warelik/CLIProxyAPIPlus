@@ -22,8 +22,8 @@ type SessionCache struct {
 	entries    map[string]sessionEntry
 	ttl        time.Duration
 	stopCh     chan struct{}
-	generation uint64
 	stopOnce   sync.Once
+	generation uint64
 }
 
 // NewSessionCache creates a cache with the specified TTL.
@@ -72,23 +72,6 @@ func (c *SessionCache) Get(sessionID string) (string, bool) {
 	return "", false
 }
 
-// Aliases returns all currently known alias identifiers for the session entry.
-func (c *SessionCache) Aliases(sessionID string) []string {
-	if sessionID == "" {
-		return nil
-	}
-	now := time.Now()
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	entry, ok := c.entries[sessionID]
-	if !ok || !now.Before(entry.expiresAt) {
-		return nil
-	}
-	res := make([]string, len(entry.aliases))
-	copy(res, entry.aliases)
-	return res
-}
-
 // GetAndRefresh retrieves the auth ID bound to a session and refreshes the TTL
 // for every identifier known to represent the same logical session.
 func (c *SessionCache) GetAndRefresh(sessionID string) (string, bool) {
@@ -112,8 +95,24 @@ func (c *SessionCache) GetAndRefresh(sessionID string) (string, bool) {
 	return entry.authID, true
 }
 
-// GetWithGeneration retrieves the auth ID, monotonic generation token, and alias list
-// bound to a session without refreshing the TTL.
+// Observe returns the current generation token, auth ID, and aliases for a session ID
+// without refreshing its TTL or acquiring a write lock.
+func (c *SessionCache) Observe(sessionID string) (gen uint64, authID string, aliases []string, ok bool) {
+	if c == nil || sessionID == "" {
+		return 0, "", nil, false
+	}
+	now := time.Now()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	entry, exists := c.entries[sessionID]
+	if !exists || !now.Before(entry.expiresAt) {
+		return 0, "", nil, false
+	}
+	return entry.generation, entry.authID, append([]string(nil), entry.aliases...), true
+}
+
+// GetWithGeneration returns the auth ID, generation, and aliases for a session ID
+// without refreshing its TTL.
 func (c *SessionCache) GetWithGeneration(sessionID string) (string, uint64, []string, bool) {
 	if sessionID == "" {
 		return "", 0, nil, false
@@ -137,49 +136,6 @@ func (c *SessionCache) Set(sessionID, authID string) {
 // SetAliases binds multiple identifiers for one logical session to an auth ID.
 func (c *SessionCache) SetAliases(authID string, sessionIDs ...string) {
 	c.setAliasesUntil(authID, time.Now().Add(c.ttl), sessionIDs...)
-}
-
-// SetAliasGroupIfAbsent binds all sessionIDs to authID only if none of the
-// sessionIDs are currently live. It returns the existing authID if any alias
-// is already live and false. Otherwise it sets the group and returns
-// (authID, true).
-func (c *SessionCache) SetAliasGroupIfAbsent(authID string, sessionIDs ...string) (string, bool) {
-	if c == nil || authID == "" || len(sessionIDs) == 0 {
-		return "", false
-	}
-	now := time.Now()
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	var liveAuthID string
-	for _, sid := range sessionIDs {
-		if sid == "" {
-			continue
-		}
-		if entry, ok := c.entries[sid]; ok && now.Before(entry.expiresAt) {
-			liveAuthID = entry.authID
-			break
-		}
-	}
-	if liveAuthID != "" {
-		return liveAuthID, false
-	}
-
-	aliases := compactSessionAliases(sessionIDs)
-	if len(aliases) == 0 {
-		return "", false
-	}
-	c.generation++
-	entry := sessionEntry{
-		authID:     authID,
-		expiresAt:  now.Add(c.ttl),
-		aliases:    aliases,
-		generation: c.generation,
-	}
-	for _, alias := range aliases {
-		c.entries[alias] = entry
-	}
-	return authID, true
 }
 
 // RestoreAliasesIfAbsent atomically sets the still-absent aliases to authID.
@@ -322,18 +278,18 @@ func (c *SessionCache) setAliasesUntilLocked(authID string, expiresAt time.Time,
 }
 
 func (c *SessionCache) replaceAliasGroupsLocked(authID string, expiresAt time.Time, aliases []string, previousGroups ...sessionEntry) {
-	c.generation++
-	gen := c.generation
 	for _, previous := range previousGroups {
 		c.removeAliasGroupLocked(previous)
 	}
-	entry := sessionEntry{authID: authID, expiresAt: expiresAt, aliases: aliases, generation: gen}
+	c.generation++
+	entry := sessionEntry{authID: authID, expiresAt: expiresAt, aliases: aliases, generation: c.generation}
 	for _, alias := range aliases {
 		c.entries[alias] = entry
 	}
 }
 
 func (c *SessionCache) removeAliasGroupLocked(entry sessionEntry) {
+	c.generation++
 	for _, alias := range entry.aliases {
 		current, ok := c.entries[alias]
 		if !ok || current.authID != entry.authID || !current.expiresAt.Equal(entry.expiresAt) ||
@@ -342,6 +298,76 @@ func (c *SessionCache) removeAliasGroupLocked(entry sessionEntry) {
 		}
 		delete(c.entries, alias)
 	}
+}
+
+// CompareAndReplaceGroup atomically validates that an observed group has not mutated
+// (matching expectedGen, expectedAuthID, and expectedAliases), confirms no requested
+// new alias belongs to another active live group, and replaces the whole group with newAuthID.
+func (c *SessionCache) CompareAndReplaceGroup(expectedGen uint64, expectedAuthID string, expectedAliases []string, newAuthID string, newSessionIDs ...string) bool {
+	if c == nil || newAuthID == "" {
+		return false
+	}
+	now := time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if expectedGen != 0 {
+		if len(expectedAliases) == 0 {
+			return false
+		}
+		for _, alias := range expectedAliases {
+			current, ok := c.entries[alias]
+			if !ok || !now.Before(current.expiresAt) {
+				return false
+			}
+			if current.generation != expectedGen || current.authID != expectedAuthID || !equalSessionAliases(current.aliases, expectedAliases) {
+				return false
+			}
+		}
+	} else {
+		for _, sid := range newSessionIDs {
+			if sid == "" {
+				continue
+			}
+			if current, ok := c.entries[sid]; ok && now.Before(current.expiresAt) {
+				return false
+			}
+		}
+	}
+
+	candidateAliases := mergeSessionAliases(expectedAliases, newSessionIDs...)
+	for _, alias := range candidateAliases {
+		current, ok := c.entries[alias]
+		if !ok || !now.Before(current.expiresAt) {
+			continue
+		}
+		if expectedGen == 0 || current.generation != expectedGen || current.authID != expectedAuthID {
+			return false
+		}
+	}
+
+	newAliases := compactSessionAliases(candidateAliases)
+	if len(newAliases) == 0 {
+		return false
+	}
+
+	if expectedGen != 0 {
+		for _, alias := range expectedAliases {
+			delete(c.entries, alias)
+		}
+	}
+
+	c.generation++
+	entry := sessionEntry{
+		authID:     newAuthID,
+		expiresAt:  now.Add(c.ttl),
+		aliases:    newAliases,
+		generation: c.generation,
+	}
+	for _, alias := range newAliases {
+		c.entries[alias] = entry
+	}
+	return true
 }
 
 func compactSessionAliases(aliases []string) []string {
@@ -516,36 +542,33 @@ func (c *SessionCache) Invalidate(sessionID string) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	entry, ok := c.entries[sessionID]
-	if !ok {
-		return
-	}
-	delete(c.entries, sessionID)
 	c.generation++
-	gen := c.generation
-	for _, alias := range entry.aliases {
-		if alias == sessionID {
-			continue
-		}
-		current, exists := c.entries[alias]
-		if !exists || current.authID != entry.authID {
-			continue
-		}
-		filtered := make([]string, 0, len(current.aliases))
-		for _, candidate := range current.aliases {
-			if candidate != sessionID {
-				filtered = append(filtered, candidate)
+	entry, ok := c.entries[sessionID]
+	delete(c.entries, sessionID)
+	if ok {
+		for _, alias := range entry.aliases {
+			if alias == sessionID {
+				continue
 			}
+			current, exists := c.entries[alias]
+			if !exists || current.authID != entry.authID {
+				continue
+			}
+			filtered := make([]string, 0, len(current.aliases))
+			for _, candidate := range current.aliases {
+				if candidate != sessionID {
+					filtered = append(filtered, candidate)
+				}
+			}
+			current.aliases = filtered
+			current.generation = c.generation
+			c.entries[alias] = current
 		}
-		current.aliases = filtered
-		current.generation = gen
-		c.entries[alias] = current
 	}
 }
 
-// CompareAndDeleteAliases removes the alias group holding sessionID when it is
-// still bound to expectedAuthID, and returns the group's aliases. A stale
-// expectation cannot remove a newer group.
+// CompareAndDeleteAliases removes a binding and returns every alias that still
+// belongs to the same expected auth. A stale result cannot remove a newer group.
 func (c *SessionCache) CompareAndDeleteAliases(sessionID, expectedAuthID string) []string {
 	if c == nil || sessionID == "" || expectedAuthID == "" {
 		return nil
@@ -558,12 +581,7 @@ func (c *SessionCache) CompareAndDeleteAliases(sessionID, expectedAuthID string)
 		return nil
 	}
 	aliases := append([]string(nil), entry.aliases...)
-	c.generation++
-	for _, alias := range aliases {
-		if current, exists := c.entries[alias]; exists && current.authID == expectedAuthID && equalSessionAliases(current.aliases, entry.aliases) {
-			delete(c.entries, alias)
-		}
-	}
+	c.removeAliasGroupLocked(entry)
 	return aliases
 }
 
@@ -572,8 +590,6 @@ func (c *SessionCache) CompareAndDeleteAliases(sessionID, expectedAuthID string)
 // aliases. A concurrent refresh or extension of the group bumps the
 // generation or changes the aliases, so a stale observation cannot delete
 // newer state; callers retry their merge on a nil result.
-//
-// Mirror of CLIProxyAPI dd8c72a3.
 func (c *SessionCache) CompareAndDeleteGroup(sessionID, expectedAuthID string, expectedGen uint64, expectedAliases []string) []string {
 	if c == nil || sessionID == "" || expectedAuthID == "" {
 		return nil
@@ -589,21 +605,14 @@ func (c *SessionCache) CompareAndDeleteGroup(sessionID, expectedAuthID string, e
 		return nil
 	}
 	removed := append([]string(nil), entry.aliases...)
-	c.generation++
-	for _, alias := range removed {
-		if current, exists := c.entries[alias]; exists && current.authID == expectedAuthID && equalSessionAliases(current.aliases, entry.aliases) {
-			delete(c.entries, alias)
-		}
-	}
+	c.removeAliasGroupLocked(entry)
 	return removed
 }
 
-// CompareAndReplaceAliases atomically validates that every observed alias still
-// maps to expectedAuthID with expectedGen, that all observed aliases belong to the
-// exact same group, and that no additional alias is currently bound to
-// another active group. Upon validation, it replaces the entire alias group with
-// newAuthID, a refreshed TTL, and an incremented monotonic generation token.
-// It returns true if replaced, or false if the CAS precondition failed.
+// CompareAndReplaceAliases atomically replaces a group of aliases with a new
+// auth ID when the observed auth ID, generation, and alias set still match.
+// It also extends the matched aliases with additionalAliases when they are not
+// already bound to another live group.
 func (c *SessionCache) CompareAndReplaceAliases(
 	expectedAuthID string,
 	expectedGen uint64,
@@ -787,6 +796,7 @@ func (c *SessionCache) InvalidateAuth(authID string) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.generation++
 	for sid, entry := range c.entries {
 		if entry.authID == authID {
 			delete(c.entries, sid)
@@ -820,10 +830,10 @@ func (c *SessionCache) cleanupLoop() {
 func (c *SessionCache) cleanup() {
 	now := time.Now()
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	for sid, entry := range c.entries {
 		if !now.Before(entry.expiresAt) {
 			delete(c.entries, sid)
 		}
 	}
+	c.mu.Unlock()
 }

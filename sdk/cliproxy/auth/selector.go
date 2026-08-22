@@ -630,6 +630,7 @@ type SessionAffinitySelector struct {
 	fallback      Selector
 	cache         *SessionCache
 	fallbackCache *SessionCache
+	quarantine    *SessionCache
 }
 
 // SessionAffinityConfig configures the session affinity selector.
@@ -654,10 +655,15 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 	if cfg.TTL <= 0 {
 		cfg.TTL = time.Hour
 	}
+	quarantineTTL := 5 * time.Second
+	if cfg.TTL < quarantineTTL {
+		quarantineTTL = cfg.TTL
+	}
 	return &SessionAffinitySelector{
 		fallback:      cfg.Fallback,
 		cache:         NewSessionCache(cfg.TTL),
 		fallbackCache: NewSessionCache(cfg.TTL),
+		quarantine:    NewSessionCache(quarantineTTL),
 	}
 }
 
@@ -710,6 +716,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		fallbackKey = provider + "::" + fallbackID + "::" + modelKey
 	}
 
+	available = s.excludeSessionQuarantine(cacheKey, fallbackKey, available)
 	fallbackAuths := highestPriorityAuths(available)
 	bind := func(authID string) {
 		if fallbackKey != "" {
@@ -724,7 +731,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		if fallbackKey != "" {
 			keys = append(keys, fallbackKey)
 		}
-		if aliases := s.cache.Aliases(cacheKey); len(aliases) > 0 {
+		if _, _, aliases, ok := s.cache.Observe(cacheKey); ok {
 			for _, alias := range aliases {
 				if alias != "" {
 					keys = append(keys, alias)
@@ -732,7 +739,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			}
 		}
 		if fallbackKey != "" {
-			if aliases := s.cache.Aliases(fallbackKey); len(aliases) > 0 {
+			if _, _, aliases, ok := s.cache.Observe(fallbackKey); ok {
 				for _, alias := range aliases {
 					if alias != "" {
 						keys = append(keys, alias)
@@ -946,6 +953,50 @@ func (s *SessionAffinitySelector) mergeSplitAliasGroupsCAS(cacheKey, fallbackKey
 	return false
 }
 
+func (s *SessionAffinitySelector) excludeSessionQuarantine(cacheKey, fallbackKey string, auths []*Auth) []*Auth {
+	if s == nil || s.quarantine == nil || len(auths) == 0 {
+		return auths
+	}
+	filtered := make([]*Auth, 0, len(auths))
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		blocked := false
+		for _, key := range []string{cacheKey, fallbackKey} {
+			if key == "" {
+				continue
+			}
+			if _, ok := s.quarantine.Get(key + "::failed::" + auth.ID); ok {
+				blocked = true
+				break
+			}
+		}
+		if !blocked {
+			filtered = append(filtered, auth)
+		}
+	}
+	return filtered
+}
+
+func (s *SessionAffinitySelector) quarantineSessionAuth(cacheKeys []string, authID string, retryAfter *time.Duration) {
+	if s == nil || s.quarantine == nil || authID == "" {
+		return
+	}
+	delay := 5 * time.Second
+	if retryAfter != nil && *retryAfter > 0 {
+		delay = *retryAfter
+	}
+	expiresAt := time.Now().Add(delay)
+	for _, key := range cacheKeys {
+		if key == "" {
+			continue
+		}
+		quarantineKey := key + "::failed::" + authID
+		s.quarantine.setAliasesUntil(authID, expiresAt, quarantineKey)
+	}
+}
+
 // OnResult handles session affinity binding or release based on execution outcome.
 func (s *SessionAffinitySelector) OnResult(res Result) {
 	if s == nil || s.cache == nil || res.AuthID == "" {
@@ -982,7 +1033,7 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
 		if fallbackKey != "" {
 			keys = append(keys, fallbackKey)
 		}
-		if aliases := s.cache.Aliases(cacheKey); len(aliases) > 0 {
+		if _, _, aliases, ok := s.cache.Observe(cacheKey); ok {
 			for _, alias := range aliases {
 				if alias != "" {
 					keys = append(keys, alias)
@@ -990,7 +1041,7 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
 			}
 		}
 		if fallbackKey != "" {
-			if aliases := s.cache.Aliases(fallbackKey); len(aliases) > 0 {
+			if _, _, aliases, ok := s.cache.Observe(fallbackKey); ok {
 				for _, alias := range aliases {
 					if alias != "" {
 						keys = append(keys, alias)
@@ -1028,15 +1079,22 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
 	}
 
 	if res.Error != nil && isTerminalSessionAffinityError(res.Error) {
-		s.cache.CompareAndDelete(cacheKey, res.AuthID)
-		if fallbackKey != "" {
-			s.cache.CompareAndDelete(fallbackKey, res.AuthID)
+		var aliases []string
+		if s.cache != nil {
+			aliases = s.cache.CompareAndDeleteAliases(cacheKey, res.AuthID)
+			if len(aliases) == 0 && fallbackKey != "" {
+				aliases = s.cache.CompareAndDeleteAliases(fallbackKey, res.AuthID)
+			}
+		}
+		if len(aliases) == 0 {
+			aliases = []string{cacheKey, fallbackKey}
 		}
 		if s.fallbackCache != nil {
 			for _, tk := range collectResultTempFallbackKeys() {
 				s.fallbackCache.CompareAndDelete(tk, res.AuthID)
 			}
 		}
+		s.quarantineSessionAuth(aliases, res.AuthID, res.RetryAfter)
 	}
 }
 
@@ -1097,6 +1155,9 @@ func (s *SessionAffinitySelector) Stop() {
 	if s.fallbackCache != nil {
 		s.fallbackCache.Stop()
 	}
+	if s.quarantine != nil {
+		s.quarantine.Stop()
+	}
 }
 
 // InvalidateAuth removes all session bindings for a specific auth.
@@ -1107,6 +1168,9 @@ func (s *SessionAffinitySelector) InvalidateAuth(authID string) {
 	}
 	if s.fallbackCache != nil {
 		s.fallbackCache.InvalidateAuth(authID)
+	}
+	if s.quarantine != nil {
+		s.quarantine.InvalidateAuth(authID)
 	}
 }
 

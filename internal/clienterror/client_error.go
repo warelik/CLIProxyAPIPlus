@@ -86,11 +86,12 @@ func IsRequestFault(status int, err error) bool {
 	if status == http.StatusPaymentRequired || status == http.StatusTooManyRequests {
 		return false
 	}
-	// Authentication and invalid-or-expired-credential failures are caused by
-	// the credential, not the request: they must remain eligible for rotation
-	// by the shared mixed-auth loop even when the provider pairs them with a
-	// generic invalid-request identifier in the body. This must be checked
-	// before hasRequestFaultBody so the generic classifier cannot misfile them.
+	// DeepSeek reports an invalid API key as 401 with the authentication_error
+	// type alongside the same generic code. Other providers also surface an
+	// invalid or expired credential as the authentication_error body on 403.
+	// Preserve that credential failure classification without weakening generic
+	// request-fault handling: a request-fault-looking code on the same body does
+	// not turn a credential rejection into a request fault.
 	if (status == http.StatusUnauthorized || status == http.StatusForbidden) && hasAuthenticationErrorBody(err) {
 		return false
 	}

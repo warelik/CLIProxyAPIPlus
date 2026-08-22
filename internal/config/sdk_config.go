@@ -84,7 +84,7 @@ type StreamingConfig struct {
 	BootstrapRetries int `yaml:"bootstrap-retries,omitempty" json:"bootstrap-retries,omitempty"`
 
 	// StreamConnectTimeoutSeconds controls the maximum time to wait for connection/stream establishment from an upstream stream before timing out and failing over.
-	// <= 0 disables stream connect timeout. Default is 0.
+	// Zero or a negative value disables the timeout.
 	StreamConnectTimeoutSeconds int `yaml:"stream-connect-timeout-seconds,omitempty" json:"stream-connect-timeout-seconds,omitempty"`
 
 	// StreamFirstChunkTimeoutSeconds is a deprecated alias for StreamConnectTimeoutSeconds.
