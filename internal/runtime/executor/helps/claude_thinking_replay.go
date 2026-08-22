@@ -291,12 +291,30 @@ func ClaudeThinkingReplayFindStartIndex(assistantContents []gjson.Result, cached
 	return chosen.start, chosen.matches
 }
 
+// canMatchEarlier reports whether the first k cached turns (starting at start)
+// can be matched in order using only request positions before limit. A greedy
+// left-to-right scan is sufficient because choosing the earliest match for each
+// cached turn leaves the most room for the rest.
+func canMatchEarlier(assistantContents []gjson.Result, cachedContents [][]byte, start, k, limit int) bool {
+	j := 0
+	for i := 0; i < k; i++ {
+		cached := gjson.ParseBytes(cachedContents[start+i])
+		for j < limit && !ClaudeThinkingReplayContentsMatch(assistantContents[j], cached) {
+			j++
+		}
+		if j == limit {
+			return false
+		}
+		j++
+	}
+	return true
+}
+
 // rightmostSubsequenceMatch finds a strictly increasing sequence of request
 // indices such that assistantContents[matches[k]] matches cachedContents[start+k].
-// When multiple request turns match the same cached turn, it prefers the one
-// that already carries thinking content. If no retained turn disambiguates and
-// there are more matching unsigned request turns than remaining cached turns,
-// the anchor is ambiguous and the match fails.
+// For each cached turn, multiple request candidates are accepted only when the
+// preceding cached turns can consume all but one of them. A single retained
+// (thinking-bearing) candidate disambiguates otherwise-duplicate candidates.
 func rightmostSubsequenceMatch(assistantContents []gjson.Result, cachedContents [][]byte, start, l int) []int {
 	matches := make([]int, l)
 	limit := len(assistantContents)
@@ -312,30 +330,45 @@ func rightmostSubsequenceMatch(assistantContents []gjson.Result, cachedContents 
 			return nil
 		}
 
-		// Prefer the rightmost candidate with thinking (a retained turn). Stop
-		// as soon as the index is too small to leave room for earlier matches.
-		remaining := k + 1
-		selected := -1
+		// A candidate is viable if the earlier cached turns can still fit in the
+		// request positions before it. This replaces the coarse `len(candidates) >
+		// remaining` check and accounts for which duplicate candidates the
+		// preceding cached turns can actually consume.
+		var viable []int
 		for _, i := range candidates {
 			if i < k {
-				break
+				continue
 			}
+			if canMatchEarlier(assistantContents, cachedContents, start, k, i) {
+				viable = append(viable, i)
+			}
+		}
+		if len(viable) == 0 {
+			return nil
+		}
+
+		// Prefer a single retained (thinking-bearing) viable candidate. If more
+		// than one retained candidate exists, or more than one unsigned candidate
+		// and none retained, the per-turn match is ambiguous.
+		var retained []int
+		for _, i := range viable {
 			if ContentHasThinking(assistantContents[i]) {
-				selected = i
-				break
+				retained = append(retained, i)
 			}
 		}
-		if selected < 0 {
-			if candidates[0] < k {
-				return nil
-			}
-			if len(candidates) > remaining {
-				return nil
-			}
-			selected = candidates[0]
+		if len(retained) > 1 {
+			return nil
 		}
-		matches[k] = selected
-		limit = selected
+		if len(retained) == 1 {
+			matches[k] = retained[0]
+			limit = retained[0]
+			continue
+		}
+		if len(viable) > 1 {
+			return nil
+		}
+		matches[k] = viable[0]
+		limit = viable[0]
 	}
 	return matches
 }
@@ -398,6 +431,9 @@ func ClaudeThinkingReplayUserMessageHash(modelFamily, callerHash string, msg gjs
 // ClaudeThinkingReplayAssistantMessageHash returns a stable hash for the
 // non-thinking parts of an assistant message.
 func ClaudeThinkingReplayAssistantMessageHash(modelFamily, callerHash string, content []byte) string {
+	// Strip tool-use signature/provenance fields before hashing, so an echoed
+	// tool_use with different provenance still resolves the same alias.
+	content = ClaudeThinkingReplayNormalizeCachedContent(content)
 	root := gjson.ParseBytes(content)
 	if root.Type == gjson.String {
 		normalized, err := json.Marshal([]map[string]string{{"type": "text", "text": root.String()}})

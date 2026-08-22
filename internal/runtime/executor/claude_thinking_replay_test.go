@@ -195,6 +195,92 @@ func TestClaudeThinkingReplayFindStartIndex_RefusesAmbiguousFullSuffix(t *testin
 	}
 }
 
+func TestClaudeThinkingReplayFindStartIndex_RefusesPerTurnDuplicateCandidates(t *testing.T) {
+	// Cached [A, B] and request [A, B, B-unsigned-duplicate]: the two unsigned
+	// candidates for cached B are both viable because the preceding cached A can
+	// fit before either. This is per-turn sequence ambiguity and must fail closed.
+	assistant := []gjson.Result{
+		gjson.Parse(`[{"type":"text","text":"A"}]`),
+		gjson.Parse(`[{"type":"text","text":"B"}]`),
+		gjson.Parse(`[{"type":"text","text":"B"}]`),
+	}
+	cached := [][]byte{
+		[]byte(`[{"type":"thinking","thinking":"ra","signature":"sig-a"},{"type":"text","text":"A"}]`),
+		[]byte(`[{"type":"thinking","thinking":"rb","signature":"sig-b"},{"type":"text","text":"B"}]`),
+	}
+	if got, _ := helps.ClaudeThinkingReplayFindStartIndex(assistant, cached); got != -1 {
+		t.Fatalf("expected -1 for per-turn duplicate candidates, got %d", got)
+	}
+
+	// A retained B disambiguates the duplicate unsigned B: the matcher should
+	// still pick the retained one and not fail.
+	body := []byte(`{"messages":[{"role":"user","content":"u"},{"role":"assistant","content":[{"type":"text","text":"A"}]},{"role":"assistant","content":[{"type":"text","text":"B"}]},{"role":"assistant","content":[{"type":"thinking","thinking":"rb","signature":"sig-b"},{"type":"text","text":"B"}]},{"role":"user","content":"u2"}]}`)
+	retained := [][]byte{
+		[]byte(`[{"type":"thinking","thinking":"ra","signature":"sig-a"},{"type":"text","text":"A"}]`),
+		[]byte(`[{"type":"thinking","thinking":"rb","signature":"sig-b"},{"type":"text","text":"B"}]`),
+	}
+	updated, restored := helps.RestoreClaudeThinkingReplayContents(body, retained)
+	if !restored {
+		t.Fatal("expected restore when retained B disambiguates duplicate")
+	}
+	a := gjson.GetBytes(updated, "messages.1.content").Array()
+	b := gjson.GetBytes(updated, "messages.3.content").Array()
+	duplicate := gjson.GetBytes(updated, "messages.2.content").Array()
+	if a[0].Get("signature").String() != "sig-a" {
+		t.Fatalf("A should keep sig-a, got %s", a[0].Get("signature").String())
+	}
+	if b[0].Get("signature").String() != "sig-b" {
+		t.Fatalf("retained B should keep sig-b, got %s", b[0].Get("signature").String())
+	}
+	if duplicate[0].Get("signature").String() != "" {
+		t.Fatalf("earlier unsigned duplicate B should not receive signature: %s", duplicate[0].Get("signature").String())
+	}
+}
+
+func TestClaudeThinkingReplayFindStartIndex_RefusesMultipleRetainedCandidates(t *testing.T) {
+	// Cached [A, B] and request [A, B-retained, B-retained-duplicate]: the two
+	// retained B candidates are both viable and both thinking-bearing, so the
+	// per-turn match is ambiguous and must fail closed.
+	assistant := []gjson.Result{
+		gjson.Parse(`[{"type":"thinking","thinking":"ra","signature":"sig-a"},{"type":"text","text":"A"}]`),
+		gjson.Parse(`[{"type":"thinking","thinking":"rb","signature":"sig-b-1"},{"type":"text","text":"B"}]`),
+		gjson.Parse(`[{"type":"thinking","thinking":"rb","signature":"sig-b-2"},{"type":"text","text":"B"}]`),
+	}
+	cached := [][]byte{
+		[]byte(`[{"type":"thinking","thinking":"ra","signature":"sig-a"},{"type":"text","text":"A"}]`),
+		[]byte(`[{"type":"thinking","thinking":"rb","signature":"sig-b"},{"type":"text","text":"B"}]`),
+	}
+	if got, _ := helps.ClaudeThinkingReplayFindStartIndex(assistant, cached); got != -1 {
+		t.Fatalf("expected -1 for multiple retained candidates, got %d", got)
+	}
+}
+
+func TestClaudeThinkingReplayAssistantMessageHash_IgnoresToolProvenance(t *testing.T) {
+	const (
+		modelFamily = "claude:test"
+		callerHash  = "caller"
+	)
+
+	base := []byte(`[{"type":"thinking","thinking":"r","signature":"EgI="},{"type":"tool_use","id":"toolu_1","name":"Read","input":{"path":"README.md"},"signature":"sig-a","thoughtSignature":"tsig-a","extra_content":{"google":{"thought_signature":"esig-a"}}}]`)
+	echo := []byte(`[{"type":"thinking","thinking":"r","signature":"EgI="},{"type":"tool_use","id":"toolu_1","name":"Read","input":{"path":"README.md"},"signature":"sig-b","thoughtSignature":"tsig-b","extra_content":{"google":{"thought_signature":"esig-b"}}}]`)
+
+	h1 := helps.ClaudeThinkingReplayAssistantMessageHash(modelFamily, callerHash, base)
+	h2 := helps.ClaudeThinkingReplayAssistantMessageHash(modelFamily, callerHash, echo)
+	if h1 == "" || h2 == "" {
+		t.Fatal("hash should not be empty")
+	}
+	if h1 != h2 {
+		t.Fatalf("tool-use provenance changed the alias hash: %q vs %q", h1, h2)
+	}
+
+	// A different tool input should still produce a different hash.
+	different := []byte(`[{"type":"thinking","thinking":"r","signature":"EgI="},{"type":"tool_use","id":"toolu_1","name":"Read","input":{"path":"OTHER.md"},"signature":"sig-b","thoughtSignature":"tsig-b"}]`)
+	h3 := helps.ClaudeThinkingReplayAssistantMessageHash(modelFamily, callerHash, different)
+	if h3 == h1 {
+		t.Fatalf("different tool input produced same hash: %s", h3)
+	}
+}
+
 func TestRestoreClaudeThinkingReplayContents_RejectDuplicateRequestSideAnchors(t *testing.T) {
 	// A cached signed turn followed by an uncached unsigned duplicate with the
 	// same visible content must not have its signature injected into the later
@@ -1735,6 +1821,68 @@ func internalcacheClearClaudeThinkingReplay(t *testing.T) {
 	t.Helper()
 	internalcache.ClearClaudeThinkingReplayCache()
 	t.Cleanup(internalcache.ClearClaudeThinkingReplayCache)
+}
+
+func TestCacheClaudeThinkingReplayContent_DoesNotRegisterAliasOnFailedCacheWrite(t *testing.T) {
+	internalcacheClearClaudeThinkingReplay(t)
+
+	ctx := context.Background()
+	const (
+		modelFamily   = "claude:test"
+		sessionKey    = "session-failed-alias"
+		callerHash    = "caller"
+		firstUserHash = "first"
+	)
+
+	content1 := []byte(`[{"type":"thinking","thinking":"r1","signature":"EgI="},{"type":"text","text":"answer one"}]`)
+	content2 := []byte(`[{"type":"thinking","thinking":"r2","signature":"EgI="},{"type":"text","text":"answer two"}]`)
+	hash1 := helps.ClaudeThinkingReplayAssistantMessageHash(modelFamily, callerHash, content1)
+	hash2 := helps.ClaudeThinkingReplayAssistantMessageHash(modelFamily, callerHash, content2)
+
+	_, snapshot, found, errGet := internalcache.GetClaudeThinkingReplayWithSnapshotIfExists(ctx, modelFamily, sessionKey)
+	if errGet != nil {
+		t.Fatalf("initial cache read: %v", errGet)
+	}
+	if found {
+		t.Fatal("initial cache should be empty")
+	}
+
+	scope := claudeThinkingReplayScope{
+		modelFamily:   modelFamily,
+		sessionKey:    sessionKey,
+		snapshot:      snapshot,
+		cacheReady:    true,
+		fallbackKey:   true,
+		callerHash:    callerHash,
+		firstUserHash: firstUserHash,
+	}
+
+	cacheClaudeThinkingReplayContent(ctx, scope, content1)
+	if resolved, ok := internalcache.ResolveClaudeThinkingReplaySessionKey(ctx, modelFamily, []internalcache.ClaudeThinkingReplayAliasMessage{{Hash: hash1, Weight: 1}}, firstUserHash); !ok || resolved != sessionKey {
+		t.Fatalf("first successful write should publish alias: ok=%v resolved=%q", ok, resolved)
+	}
+
+	// Re-using the same scope.snapshot after the first write is stale; the next
+	// cache write must fail CAS and the second response alias must not be
+	// published to a missing/failed replay record.
+	cacheClaudeThinkingReplayContent(ctx, scope, content2)
+	if resolved, ok := internalcache.ResolveClaudeThinkingReplaySessionKey(ctx, modelFamily, []internalcache.ClaudeThinkingReplayAliasMessage{{Hash: hash2, Weight: 1}}, firstUserHash); ok {
+		t.Fatalf("second alias should not be published after failed cache write, got %q", resolved)
+	}
+
+	// A fresh snapshot after the successful first write should allow the third
+	// response to be cached and its alias published.
+	_, snapshot2, _, errGet2 := internalcache.GetClaudeThinkingReplayWithSnapshotIfExists(ctx, modelFamily, sessionKey)
+	if errGet2 != nil {
+		t.Fatalf("fresh cache read: %v", errGet2)
+	}
+	scope.snapshot = snapshot2
+	content3 := []byte(`[{"type":"thinking","thinking":"r3","signature":"EgI="},{"type":"text","text":"answer three"}]`)
+	hash3 := helps.ClaudeThinkingReplayAssistantMessageHash(modelFamily, callerHash, content3)
+	cacheClaudeThinkingReplayContent(ctx, scope, content3)
+	if resolved, ok := internalcache.ResolveClaudeThinkingReplaySessionKey(ctx, modelFamily, []internalcache.ClaudeThinkingReplayAliasMessage{{Hash: hash3, Weight: 1}}, firstUserHash); !ok || resolved != sessionKey {
+		t.Fatalf("fresh-snapshot write should publish alias: ok=%v resolved=%q", ok, resolved)
+	}
 }
 
 func TestClaudeExecutorCompatThinkingReplayCrossFormatStream(t *testing.T) {
