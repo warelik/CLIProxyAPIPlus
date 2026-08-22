@@ -115,6 +115,11 @@ func sanitizeStatus(err error) string {
 	return "error"
 }
 
+// routeExhaustionClonedError wraps the original route-exhaustion cause without
+// cloning or mutating it, so typed access (errors.As(*Error), status, retry,
+// HomeConcurrencyBusyError) and the sanitized route summary both survive the
+// wrapper. The summary is appended in Error() without mutating the underlying
+// cause's fields.
 type routeExhaustionClonedError struct {
 	cause   error
 	summary string
@@ -124,7 +129,7 @@ func wrapRouteExhaustion(cause error, tracker *routeAttemptTracker) error {
 	if cause == nil {
 		return nil
 	}
-	if tracker == nil {
+	if tracker == nil || isRequestInvalidError(cause) || isRequestTerminatedError(cause) {
 		return cause
 	}
 	summary := tracker.Summary()
@@ -172,10 +177,18 @@ func (e *routeExhaustionClonedError) Unwrap() error {
 	return e.cause
 }
 
+func (e *routeExhaustionClonedError) StatusCode() int {
+	if e == nil || e.cause == nil {
+		return 0
+	}
+	return statusCodeFromError(e.cause)
+}
+
 // Headers forwards the wrapped cause's error headers if it exposes them, so
 // handlers that collect passthrough headers from the final routed error do not
-// lose them when the cause is wrapped by route exhaustion. It returns a fresh
-// copy of the cause's map and never mutates the caller's headers.
+// lose them when the cause is wrapped by route exhaustion. It returns the
+// first/outermost carrier per errors.As and a fresh copy of its map, never
+// mutating the caller's or cause's headers.
 func (e *routeExhaustionClonedError) Headers() http.Header {
 	if e == nil {
 		return nil
@@ -187,10 +200,8 @@ func (e *routeExhaustionClonedError) Headers() http.Header {
 	return nil
 }
 
-// SafeResponseHeaders forwards trusted response headers from the wrapped cause
-// if it exposes them, so handlers reading SafeResponseHeaders from the final
-// routed error keep e.g. the Home busy error's Retry-After through route
-// exhaustion. It returns a fresh copy and never mutates the caller's headers.
+// SafeResponseHeaders forwards the trusted Home busy response headers from the
+// underlying cause, nil-safe for the wrapper receiver.
 func (e *routeExhaustionClonedError) SafeResponseHeaders() http.Header {
 	if e == nil {
 		return nil

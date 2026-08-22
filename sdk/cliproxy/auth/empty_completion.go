@@ -79,10 +79,12 @@ const maxStreamBootstrapBytes = 1 << 20
 // completions.
 type openAIChunk struct {
 	Choices []struct {
+		Index *int   `json:"index"`
 		Text  string `json:"text"`
 		Delta struct {
 			Content          string            `json:"content"`
 			ReasoningContent string            `json:"reasoning_content"`
+			Reasoning        string            `json:"reasoning"`
 			Refusal          *string           `json:"refusal"`
 			ToolCalls        []json.RawMessage `json:"tool_calls"`
 			FunctionCall     json.RawMessage   `json:"function_call"`
@@ -92,6 +94,7 @@ type openAIChunk struct {
 		Message struct {
 			Content          string            `json:"content"`
 			ReasoningContent string            `json:"reasoning_content"`
+			Reasoning        string            `json:"reasoning"`
 			Refusal          *string           `json:"refusal"`
 			ToolCalls        []json.RawMessage `json:"tool_calls"`
 			FunctionCall     json.RawMessage   `json:"function_call"`
@@ -228,6 +231,29 @@ func hasMeaningfulToolCalls(rawCalls []json.RawMessage) bool {
 	return false
 }
 
+// hasMeaningfulGeminiMediaPayload reports whether a Gemini media part contains usable content.
+// Matching the translator semantics, inlineData counts only when data is non-blank and fileData
+// only when fileUri is non-blank; a scaffold object with only a mimeType carries no media.
+func hasMeaningfulGeminiMediaPayload(inlineData, fileData json.RawMessage) bool {
+	if len(bytes.TrimSpace(inlineData)) > 0 {
+		var v struct {
+			Data string `json:"data"`
+		}
+		if json.Unmarshal(inlineData, &v) == nil && strings.TrimSpace(v.Data) != "" {
+			return true
+		}
+	}
+	if len(bytes.TrimSpace(fileData)) > 0 {
+		var v struct {
+			FileURI string `json:"fileUri"`
+		}
+		if json.Unmarshal(fileData, &v) == nil && strings.TrimSpace(v.FileURI) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 func isMeaningfulGeminiFunctionCall(raw json.RawMessage) bool {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
@@ -244,6 +270,98 @@ func isMeaningfulGeminiFunctionCall(raw json.RawMessage) bool {
 		return true
 	}
 	return nonEmptyJSONPayload(call.Args)
+}
+
+type geminiGroundingChunk struct {
+	Web *struct {
+		URI   string `json:"uri"`
+		Title string `json:"title"`
+	} `json:"web"`
+	RetrievedContext *struct {
+		URI   string `json:"uri"`
+		Title string `json:"title"`
+		Text  string `json:"text"`
+	} `json:"retrievedContext"`
+}
+
+type geminiGroundingMetadata struct {
+	WebSearchQueries []string               `json:"webSearchQueries"`
+	GroundingChunks  []geminiGroundingChunk `json:"groundingChunks"`
+	SearchEntryPoint *struct {
+		RenderedContent string `json:"renderedContent"`
+	} `json:"searchEntryPoint"`
+	RetrievalQueries []string `json:"retrievalQueries"`
+}
+
+func hasMeaningfulGroundingMetadata(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) || bytes.Equal(trimmed, []byte("{}")) || bytes.Equal(trimmed, []byte("[]")) {
+		return false
+	}
+	var meta geminiGroundingMetadata
+	if err := json.Unmarshal(trimmed, &meta); err == nil {
+		for _, q := range meta.WebSearchQueries {
+			if strings.TrimSpace(q) != "" {
+				return true
+			}
+		}
+		for _, q := range meta.RetrievalQueries {
+			if strings.TrimSpace(q) != "" {
+				return true
+			}
+		}
+		for _, chunk := range meta.GroundingChunks {
+			if chunk.Web != nil {
+				if strings.TrimSpace(chunk.Web.URI) != "" || strings.TrimSpace(chunk.Web.Title) != "" {
+					return true
+				}
+			}
+			if chunk.RetrievedContext != nil {
+				if strings.TrimSpace(chunk.RetrievedContext.URI) != "" ||
+					strings.TrimSpace(chunk.RetrievedContext.Title) != "" ||
+					strings.TrimSpace(chunk.RetrievedContext.Text) != "" {
+					return true
+				}
+			}
+		}
+		if meta.SearchEntryPoint != nil && strings.TrimSpace(meta.SearchEntryPoint.RenderedContent) != "" {
+			return true
+		}
+	}
+	var generic map[string]any
+	if err := json.Unmarshal(trimmed, &generic); err == nil {
+		for k, v := range generic {
+			if k == "groundingChunks" || k == "webSearchQueries" || k == "retrievalQueries" || k == "searchEntryPoint" {
+				continue
+			}
+			switch val := v.(type) {
+			case nil:
+			case string:
+				if strings.TrimSpace(val) != "" {
+					return true
+				}
+			case map[string]any:
+				if len(val) > 0 {
+					for _, mv := range val {
+						if s, ok := mv.(string); ok && strings.TrimSpace(s) != "" {
+							return true
+						}
+					}
+				}
+			case []any:
+				if len(val) > 0 {
+					for _, ev := range val {
+						if s, ok := ev.(string); ok && strings.TrimSpace(s) != "" {
+							return true
+						}
+					}
+				}
+			default:
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func isMeaningfulToolCall(raw json.RawMessage) bool {
@@ -337,10 +455,12 @@ type geminiPart struct {
 }
 
 type geminiCandidate struct {
+	Index   *int `json:"index"`
 	Content *struct {
 		Parts []geminiPart `json:"parts"`
 	} `json:"content"`
-	FinishReason *string `json:"finishReason"`
+	FinishReason      *string         `json:"finishReason"`
+	GroundingMetadata json.RawMessage `json:"groundingMetadata"`
 }
 
 type geminiUsageMetadata struct {
@@ -352,13 +472,15 @@ type geminiPromptFeedback struct {
 }
 
 type geminiChunk struct {
-	Candidates     []geminiCandidate     `json:"candidates"`
-	UsageMetadata  *geminiUsageMetadata  `json:"usageMetadata"`
-	PromptFeedback *geminiPromptFeedback `json:"promptFeedback"`
-	Response       *struct {
-		Candidates     []geminiCandidate     `json:"candidates"`
-		UsageMetadata  *geminiUsageMetadata  `json:"usageMetadata"`
-		PromptFeedback *geminiPromptFeedback `json:"promptFeedback"`
+	Candidates        []geminiCandidate     `json:"candidates"`
+	UsageMetadata     *geminiUsageMetadata  `json:"usageMetadata"`
+	PromptFeedback    *geminiPromptFeedback `json:"promptFeedback"`
+	GroundingMetadata json.RawMessage       `json:"groundingMetadata"`
+	Response          *struct {
+		Candidates        []geminiCandidate     `json:"candidates"`
+		UsageMetadata     *geminiUsageMetadata  `json:"usageMetadata"`
+		PromptFeedback    *geminiPromptFeedback `json:"promptFeedback"`
+		GroundingMetadata json.RawMessage       `json:"groundingMetadata"`
 	} `json:"response"`
 }
 
@@ -369,9 +491,10 @@ type openAIResponseUsage struct {
 }
 
 type openAIResponseContentPart struct {
-	Type    string `json:"type"`
-	Text    string `json:"text"`
-	Refusal string `json:"refusal"`
+	Type        string            `json:"type"`
+	Text        string            `json:"text"`
+	Refusal     string            `json:"refusal"`
+	Annotations []json.RawMessage `json:"annotations"`
 }
 
 type openAIResponseOutputItem struct {
@@ -384,6 +507,7 @@ type openAIResponseOutputItem struct {
 	Arguments        string                      `json:"arguments"`
 	Result           string                      `json:"result"`
 	Action           json.RawMessage             `json:"action"`
+	Results          json.RawMessage             `json:"results"`
 	Content          []openAIResponseContentPart `json:"content"`
 	EncryptedContent string                      `json:"encrypted_content"`
 	Summary          json.RawMessage             `json:"summary"`
@@ -395,12 +519,20 @@ type openAIResponseObject struct {
 	Usage  *openAIResponseUsage `json:"usage"`
 }
 
+type openAIResponsePart struct {
+	Type             string            `json:"type"`
+	Text             string            `json:"text"`
+	EncryptedContent string            `json:"encrypted_content"`
+	Annotations      []json.RawMessage `json:"annotations"`
+}
+
 type openAIResponseChunk struct {
 	Type      string                `json:"type"`
 	Object    string                `json:"object"`
 	Status    string                `json:"status"`
 	Output    json.RawMessage       `json:"output"`
 	Item      json.RawMessage       `json:"item"`
+	Part      json.RawMessage       `json:"part"`
 	Usage     *openAIResponseUsage  `json:"usage"`
 	Response  *openAIResponseObject `json:"response"`
 	Delta     string                `json:"delta"`
@@ -419,11 +551,24 @@ var openAIResponseEventTypes = map[string]bool{
 	"response.failed":                        true,
 	"response.output_item.added":             true,
 	"response.output_item.done":              true,
+	"response.content_part.added":            true,
+	"response.content_part.done":             true,
 	"response.output_text.delta":             true,
 	"response.output_text.done":              true,
+	"response.reasoning_summary_part.added":  true,
+	"response.reasoning_summary_part.done":   true,
+	"response.reasoning_summary_text.delta":  true,
+	"response.reasoning_summary_text.done":   true,
+	"response.reasoning_text.delta":          true,
+	"response.reasoning_text.done":           true,
 	"response.function_call_arguments.delta": true,
 	"response.function_call_arguments.done":  true,
+	"response.web_search_call.in_progress":   true,
+	"response.web_search_call.searching":     true,
+	"response.web_search_call.completed":     true,
 	"error":                                  true,
+	"codex.rate_limits":                      true,
+	"codex.response.metadata":                true,
 }
 
 var interactionsEventTypes = map[string]bool{
@@ -574,19 +719,25 @@ func hasMeaningfulInteractionsArguments(raw json.RawMessage) bool {
 // emptyCompletionAccum accumulates the properties relevant to deciding whether
 // an OpenAI-, Claude-, or Gemini-style completion is empty.
 type emptyCompletionAccum struct {
-	recognized           bool
-	sawUnknownData       bool
-	terminal             bool
-	hasContent           bool
-	hasToolCalls         bool
-	completionTokens     int
-	sawUsage             bool
-	blocked              bool
-	sawMetadataOnly      bool
-	sawMessageData       bool
-	geminiTerminal       bool
-	claudeTerminal       bool
-	interactionsTerminal bool
+	expectedChoices          int
+	recognized               bool
+	sawUnknownData           bool
+	terminal                 bool
+	hasContent               bool
+	hasToolCalls             bool
+	completionTokens         int
+	sawUsage                 bool
+	blocked                  bool
+	sawMetadataOnly          bool
+	sawMessageData           bool
+	geminiTerminal           bool
+	claudeTerminal           bool
+	openAITerminal           bool
+	interactionsTerminal     bool
+	openAIChoicesSeen        map[int]bool
+	openAIChoicesFinished    map[int]bool
+	geminiCandidatesSeen     map[int]bool
+	geminiCandidatesFinished map[int]bool
 }
 
 func (a *emptyCompletionAccum) evalJSON(data []byte) bool {
@@ -596,7 +747,11 @@ func (a *emptyCompletionAccum) evalJSON(data []byte) bool {
 	}
 	recognized := false
 	for _, v := range values {
-		if a.evalOpenAI(v) || a.evalClaude(v) || a.evalOpenAIResponse(v) || a.evalGemini(v) || a.evalInteractions(v) {
+		if evalProviderError(v, "") != nil {
+			recognized = true
+			a.blocked = true
+			a.terminal = true
+		} else if a.evalOpenAI(v) || a.evalClaude(v) || a.evalOpenAIResponse(v) || a.evalGemini(v) || a.evalInteractions(v) {
 			recognized = true
 		} else {
 			a.sawUnknownData = true
@@ -632,11 +787,7 @@ func (a *emptyCompletionAccum) evalOpenAI(data []byte) bool {
 	// Recognize the OpenAI shape by the presence of a "choices" key, even when
 	// the array is empty (e.g. {"choices":[]}). Such prefixes must still be
 	// judged at stream close instead of being forwarded immediately.
-	var probe map[string]json.RawMessage
-	if err := json.Unmarshal(data, &probe); err != nil {
-		return false
-	}
-	if _, ok := probe["choices"]; !ok {
+	if !hasJSONKey(data, "choices") {
 		return false
 	}
 	a.recognized = true
@@ -655,10 +806,20 @@ func (a *emptyCompletionAccum) evalOpenAI(data []byte) bool {
 		a.sawUsage = true
 		a.addUsage(*chunk.Usage.CompletionTokens)
 	}
-	for _, ch := range chunk.Choices {
+	if a.openAIChoicesSeen == nil {
+		a.openAIChoicesSeen = make(map[int]bool)
+		a.openAIChoicesFinished = make(map[int]bool)
+	}
+	for i, ch := range chunk.Choices {
+		idx := i
+		if ch.Index != nil {
+			idx = *ch.Index
+		}
+		a.openAIChoicesSeen[idx] = true
 		if ch.FinishReason != nil {
 			reason := strings.TrimSpace(*ch.FinishReason)
 			if strings.EqualFold(reason, "stop") || strings.EqualFold(reason, "tool_calls") || strings.EqualFold(reason, "function_call") {
+				a.openAIChoicesFinished[idx] = true
 				a.terminal = true
 			} else if reason != "" {
 				// content_filter, length, and other non-stop terminal reasons
@@ -668,7 +829,7 @@ func (a *emptyCompletionAccum) evalOpenAI(data []byte) bool {
 				a.terminal = true
 			}
 		}
-		content := ch.Text + ch.Delta.Content + ch.Message.Content + ch.Delta.ReasoningContent + ch.Message.ReasoningContent
+		content := ch.Text + ch.Delta.Content + ch.Message.Content + ch.Delta.ReasoningContent + ch.Message.ReasoningContent + ch.Delta.Reasoning + ch.Message.Reasoning
 		if strings.TrimSpace(content) != "" {
 			a.hasContent = true
 		}
@@ -689,12 +850,26 @@ func (a *emptyCompletionAccum) evalOpenAI(data []byte) bool {
 			a.hasContent = true
 		}
 	}
+	expected := a.expectedChoices
+	if expected <= 0 {
+		expected = 1
+	}
+	targetChoices := expected
+	if len(a.openAIChoicesSeen) > targetChoices {
+		targetChoices = len(a.openAIChoicesSeen)
+	}
+	if len(a.openAIChoicesFinished) >= targetChoices && len(a.openAIChoicesFinished) >= len(a.openAIChoicesSeen) && !a.blocked {
+		a.openAITerminal = true
+	} else {
+		a.openAITerminal = false
+	}
 	if len(chunk.Choices) == 0 && chunk.Usage != nil {
 		// A completed non-streaming payload with zero choices
 		// ({"choices":[], "usage":...}) never enters the loop above, so
 		// terminal would never be set and the payload would be accepted as a
 		// successful response. With usage present the response is complete, so
-		// the empty judgment can run.
+		// the empty judgment can run. (Streamed zero-choices chunks without
+		// usage are mid-stream signals and must not mark terminal here.)
 		a.terminal = true
 	}
 	return true
@@ -794,6 +969,7 @@ func (a *emptyCompletionAccum) evalClaudeStopReason(stopReason *string) {
 	reason := strings.TrimSpace(*stopReason)
 	if strings.EqualFold(reason, "end_turn") || strings.EqualFold(reason, "tool_use") {
 		a.terminal = true
+		a.claudeTerminal = true
 	} else if reason != "" {
 		// Request/output limits, refusals, and control stop reasons must reach the
 		// client instead of being converted into a credential failure.
@@ -852,19 +1028,26 @@ func (a *emptyCompletionAccum) evalOpenAIResponse(data []byte) bool {
 	}
 
 	switch evType {
-	case "response.output_text.delta":
+	case "response.output_text.delta", "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
 		if strings.TrimSpace(chunk.Delta) != "" {
 			a.hasContent = true
 		}
-	case "response.output_text.done":
+	case "response.output_text.done", "response.reasoning_summary_text.done", "response.reasoning_text.done":
 		if strings.TrimSpace(chunk.Text) != "" {
 			a.hasContent = true
+		}
+	case "response.reasoning_summary_part.added", "response.reasoning_summary_part.done", "response.content_part.added", "response.content_part.done":
+		var part openAIResponsePart
+		if err := json.Unmarshal(chunk.Part, &part); err == nil {
+			if strings.TrimSpace(part.Text) != "" || strings.TrimSpace(part.EncryptedContent) != "" || hasMeaningfulAnnotations(part.Annotations) {
+				a.hasContent = true
+			}
 		}
 	case "response.output_item.done":
 		var item openAIResponseOutputItem
 		if err := json.Unmarshal(chunk.Item, &item); err == nil {
 			itemType := strings.ToLower(strings.TrimSpace(item.Type))
-			if strings.HasSuffix(itemType, "_call") {
+			if strings.HasSuffix(itemType, "_call") && itemType != "image_generation_call" {
 				if hasMeaningfulResponsesCallItem(item) {
 					a.hasToolCalls = true
 				}
@@ -872,7 +1055,7 @@ func (a *emptyCompletionAccum) evalOpenAIResponse(data []byte) bool {
 		}
 		if err := json.Unmarshal(chunk.Output, &item); err == nil {
 			itemType := strings.ToLower(strings.TrimSpace(item.Type))
-			if strings.HasSuffix(itemType, "_call") {
+			if strings.HasSuffix(itemType, "_call") && itemType != "image_generation_call" {
 				if hasMeaningfulResponsesCallItem(item) {
 					a.hasToolCalls = true
 				}
@@ -882,6 +1065,8 @@ func (a *emptyCompletionAccum) evalOpenAIResponse(data []byte) bool {
 		if a.hasToolCalls || hasMeaningfulJSONArguments(chunk.Delta) || hasMeaningfulJSONArguments(chunk.Arguments) {
 			a.hasToolCalls = true
 		}
+	case "response.web_search_call.in_progress", "response.web_search_call.searching", "response.web_search_call.completed",
+		"codex.rate_limits", "codex.response.metadata":
 	}
 
 	a.evalOpenAIResponseRawOutput(chunk.Output)
@@ -924,7 +1109,89 @@ func hasMeaningfulResponsesCallItem(item openAIResponseOutputItem) bool {
 		hasMeaningfulJSONArguments(item.Arguments) ||
 		strings.TrimSpace(item.Input) != "" ||
 		strings.TrimSpace(item.Result) != "" ||
-		nonEmptyJSONPayload(item.Action)
+		nonEmptyJSONPayload(item.Action) ||
+		nonEmptyJSONPayload(item.Results)
+}
+
+func hasMeaningfulResponsesImageGenerationCallItem(item openAIResponseOutputItem) bool {
+	return strings.TrimSpace(item.Result) != "" || strings.TrimSpace(item.Text) != ""
+}
+
+func hasMeaningfulResponsesReasoningSummary(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return false
+	}
+	var parts []openAIResponsePart
+	if err := json.Unmarshal(trimmed, &parts); err == nil {
+		for _, part := range parts {
+			if strings.TrimSpace(part.Text) != "" || strings.TrimSpace(part.EncryptedContent) != "" {
+				return true
+			}
+		}
+		return false
+	}
+	var single openAIResponsePart
+	if err := json.Unmarshal(trimmed, &single); err == nil {
+		return strings.TrimSpace(single.Text) != "" || strings.TrimSpace(single.EncryptedContent) != ""
+	}
+	var strSlice []string
+	if err := json.Unmarshal(trimmed, &strSlice); err == nil {
+		for _, s := range strSlice {
+			if strings.TrimSpace(s) != "" {
+				return true
+			}
+		}
+		return false
+	}
+	var str string
+	if err := json.Unmarshal(trimmed, &str); err == nil {
+		return strings.TrimSpace(str) != ""
+	}
+	return false
+}
+
+func hasMeaningfulAnnotations(annotations []json.RawMessage) bool {
+	if len(annotations) == 0 {
+		return false
+	}
+	for _, raw := range annotations {
+		trimmed := bytes.TrimSpace(raw)
+		if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) || bytes.Equal(trimmed, []byte("{}")) || bytes.Equal(trimmed, []byte("[]")) {
+			continue
+		}
+		var obj map[string]any
+		if err := json.Unmarshal(trimmed, &obj); err == nil {
+			hasField := false
+			for _, v := range obj {
+				switch val := v.(type) {
+				case nil:
+				case string:
+					if strings.TrimSpace(val) != "" {
+						hasField = true
+					}
+				default:
+					hasField = true
+				}
+				if hasField {
+					break
+				}
+			}
+			if hasField {
+				return true
+			}
+			continue
+		}
+		var str string
+		if err := json.Unmarshal(trimmed, &str); err == nil {
+			if strings.TrimSpace(str) != "" {
+				return true
+			}
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 func (a *emptyCompletionAccum) evalOpenAIResponseOutput(items []openAIResponseOutputItem) {
@@ -932,7 +1199,7 @@ func (a *emptyCompletionAccum) evalOpenAIResponseOutput(items []openAIResponseOu
 		itemType := strings.ToLower(strings.TrimSpace(item.Type))
 		switch {
 		case itemType == "image_generation_call":
-			if hasMeaningfulResponsesCallItem(item) || strings.TrimSpace(item.Text) != "" {
+			if hasMeaningfulResponsesImageGenerationCallItem(item) {
 				a.hasContent = true
 			}
 		case strings.HasSuffix(itemType, "_call"):
@@ -940,7 +1207,7 @@ func (a *emptyCompletionAccum) evalOpenAIResponseOutput(items []openAIResponseOu
 				a.hasToolCalls = true
 			}
 		case itemType == "reasoning":
-			if strings.TrimSpace(item.EncryptedContent) != "" || nonEmptyJSONPayload(item.Summary) {
+			if strings.TrimSpace(item.EncryptedContent) != "" || hasMeaningfulResponsesReasoningSummary(item.Summary) {
 				a.hasContent = true
 			}
 		case itemType != "" && itemType != "message":
@@ -954,6 +1221,7 @@ func (a *emptyCompletionAccum) evalOpenAIResponseOutput(items []openAIResponseOu
 		for _, part := range item.Content {
 			partType := strings.ToLower(strings.TrimSpace(part.Type))
 			if strings.TrimSpace(part.Text) != "" || strings.TrimSpace(part.Refusal) != "" ||
+				hasMeaningfulAnnotations(part.Annotations) ||
 				partType == "refusal" || (partType != "" && partType != "output_text" && partType != "text") {
 				a.hasContent = true
 			}
@@ -973,22 +1241,21 @@ func (a *emptyCompletionAccum) evalClaudeBlocks(blocks []claudeContentBlock) {
 			a.hasToolCalls = true
 			continue
 		}
-		if b.Type == "thinking" || b.Type == "redacted_thinking" || strings.TrimSpace(b.Thinking) != "" || strings.TrimSpace(b.Signature) != "" || strings.TrimSpace(b.Data) != "" {
+		if b.Type == "thinking" || b.Type == "redacted_thinking" || b.Type == "reasoning" || strings.TrimSpace(b.Thinking) != "" || strings.TrimSpace(b.Signature) != "" || strings.TrimSpace(b.Data) != "" {
 			if strings.TrimSpace(b.Thinking) != "" || strings.TrimSpace(b.Signature) != "" || strings.TrimSpace(b.Data) != "" {
 				a.hasContent = true
 			}
 			continue
 		}
-		if strings.TrimSpace(b.Text) != "" {
-			a.hasContent = true
+		if b.Type == "text" || strings.TrimSpace(b.Text) != "" {
+			if strings.TrimSpace(b.Text) != "" {
+				a.hasContent = true
+			}
 			continue
 		}
 		if nonEmptyJSONPayload(b.Citation) {
 			a.hasContent = true
 			continue
-		}
-		if b.Type != "" && b.Type != "text" {
-			a.hasContent = true
 		}
 	}
 }
@@ -1075,32 +1342,50 @@ func (a *emptyCompletionAccum) evalGemini(data []byte) bool {
 			a.addUsage(*usage.CandidatesTokenCount)
 		}
 	}
+	if hasMeaningfulGroundingMetadata(chunk.GroundingMetadata) {
+		a.hasContent = true
+	}
+	if chunk.Response != nil && hasMeaningfulGroundingMetadata(chunk.Response.GroundingMetadata) {
+		a.hasContent = true
+	}
 
-	allTerminal := true
+	if a.geminiCandidatesSeen == nil {
+		a.geminiCandidatesSeen = make(map[int]bool)
+		a.geminiCandidatesFinished = make(map[int]bool)
+	}
+
 	blocked := false
-	for _, cand := range candidates {
-		if cand.FinishReason == nil {
-			allTerminal = false
-		} else {
+	for i, cand := range candidates {
+		idx := i
+		if cand.Index != nil {
+			idx = *cand.Index
+		}
+		a.geminiCandidatesSeen[idx] = true
+		if cand.FinishReason != nil {
 			reason := strings.TrimSpace(*cand.FinishReason)
-			if reason == "" {
-				allTerminal = false
-			} else if !strings.EqualFold(reason, "STOP") {
-				// A blocking or other terminal reason (SAFETY, RECITATION,
-				// MAX_TOKENS, BLOCKLIST, PROHIBITED_CONTENT, OTHER) is not an
-				// empty completion: the client must see the stop/block reason
-				// rather than a silent auth rotation.
-				allTerminal = false
-				blocked = true
+			if reason != "" {
+				if strings.EqualFold(reason, "STOP") {
+					a.geminiCandidatesFinished[idx] = true
+					a.terminal = true
+				} else {
+					// A blocking or other terminal reason (SAFETY, RECITATION,
+					// MAX_TOKENS, BLOCKLIST, PROHIBITED_CONTENT, OTHER) is not an
+					// empty completion: the client must see the stop/block reason
+					// rather than a silent auth rotation.
+					blocked = true
+					a.terminal = true
+				}
 			}
+		}
+		if hasMeaningfulGroundingMetadata(cand.GroundingMetadata) {
+			a.hasContent = true
 		}
 		if cand.Content != nil {
 			for _, part := range cand.Content.Parts {
 				if isMeaningfulGeminiFunctionCall(part.FunctionCall) {
 					a.hasToolCalls = true
 				}
-				if nonEmptyJSONPayload(part.InlineData) ||
-					nonEmptyJSONPayload(part.FileData) ||
+				if hasMeaningfulGeminiMediaPayload(part.InlineData, part.FileData) ||
 					nonEmptyJSONPayload(part.FunctionResponse) {
 					a.hasContent = true
 				}
@@ -1110,22 +1395,27 @@ func (a *emptyCompletionAccum) evalGemini(data []byte) bool {
 				if strings.TrimSpace(part.Text) != "" {
 					a.hasContent = true
 				}
-				// A signature alone must not count as content: it can be replay
-				// metadata for an upstream that returned nothing. Visible text,
-				// tool calls, or positive token usage still keep the completion
-				// from being classified as empty.
+
 			}
 		}
 	}
 
-	if allTerminal {
-		a.terminal = true
-		if !blocked {
-			a.geminiTerminal = true
-		}
-	}
 	if blocked {
 		a.blocked = true
+	}
+
+	expected := a.expectedChoices
+	if expected <= 0 {
+		expected = 1
+	}
+	targetCandidates := expected
+	if len(a.geminiCandidatesSeen) > targetCandidates {
+		targetCandidates = len(a.geminiCandidatesSeen)
+	}
+	if len(a.geminiCandidatesFinished) >= targetCandidates && len(a.geminiCandidatesFinished) >= len(a.geminiCandidatesSeen) && !a.blocked {
+		a.geminiTerminal = true
+	} else {
+		a.geminiTerminal = false
 	}
 
 	return true
@@ -1415,6 +1705,9 @@ func isSSEPrefix(b []byte) bool {
 func (s *streamBootstrapState) processLine(line []byte) {
 	line = bytes.TrimSpace(line)
 	if len(line) == 0 {
+		if len(s.dataLines) > 0 && classifyJSONBuffer(bytes.Join(s.dataLines, []byte("\n"))) == jsonBufIncomplete {
+			return
+		}
 		s.flushData()
 		return
 	}
@@ -1454,8 +1747,45 @@ func (s *streamBootstrapState) processSingleLine(line []byte) {
 		s.dataLines = append(s.dataLines, []byte(""))
 	case bytes.HasPrefix(line, []byte("{")), bytes.HasPrefix(line, []byte("[")):
 		s.sawSSE = true
+		// Raw JSONL/NDJSON frames are newline-terminated and never followed by a
+		// blank separator line, so buffering them would defer evaluation until the
+		// bootstrap byte cap is hit. Evaluate a self-contained frame immediately;
+		// keep buffering only when a multi-line JSON value is already in progress.
+		if len(s.dataLines) == 0 && classifyJSONBuffer(line) == jsonBufComplete {
+			if err := evalProviderError(line, ""); err != nil {
+				s.streamErr = err
+			} else if !s.acc.evalJSON(line) {
+				s.acc.sawUnknownData = true
+			}
+			return
+		}
 		s.dataLines = append(s.dataLines, line)
 	default:
+		// A pretty-printed raw JSON frame arrives one line at a time: the opening
+		// brace lands in dataLines and every continuation line looks like an
+		// isolated, invalid JSON value on its own. Append the closing line first,
+		// then classify the joined buffer; evaluate immediately when it becomes
+		// complete instead of buffering until a blank line or EOF that may not come.
+		if len(s.dataLines) > 0 {
+			s.dataLines = append(s.dataLines, line)
+			joined := bytes.Join(s.dataLines, []byte("\n"))
+			s.dataLines = s.dataLines[:0]
+			switch classifyJSONBuffer(joined) {
+			case jsonBufComplete:
+				if err := evalProviderError(joined, ""); err != nil {
+					s.streamErr = err
+				} else if !s.acc.evalJSON(joined) {
+					s.acc.sawUnknownData = true
+				}
+			case jsonBufIncomplete:
+				// The buffered value is still incomplete; restore the accumulated
+				// lines and wait for the next continuation.
+				s.dataLines = append([][]byte(nil), joined)
+			default:
+				s.acc.sawUnknownData = true
+			}
+			return
+		}
 		if classify := classifyJSONBuffer(line); classify == jsonBufComplete || classify == jsonBufIncomplete {
 			if err := evalProviderError(line, ""); err != nil {
 				s.streamErr = err
@@ -1546,7 +1876,14 @@ func (s *streamBootstrapState) isEmptyCompletion() bool {
 }
 
 func (s *streamBootstrapState) isTerminalEmpty() bool {
-	return (s.sawDone || s.acc.geminiTerminal || s.acc.claudeTerminal || s.acc.interactionsTerminal) && s.acc.empty()
+	return (s.sawDone || s.acc.geminiTerminal || s.acc.claudeTerminal || s.acc.openAITerminal || s.acc.interactionsTerminal) && s.acc.empty()
+}
+
+func (s *streamBootstrapState) setExpectedChoices(n int) {
+	if n <= 0 {
+		n = 1
+	}
+	s.acc.expectedChoices = n
 }
 
 func (s *streamBootstrapState) hasMeaningfulOutput() bool {
@@ -1573,11 +1910,14 @@ func (s *streamBootstrapState) shouldForward() bool {
 }
 
 type streamErrorEnvelope struct {
-	Type    string          `json:"type"`
-	Error   json.RawMessage `json:"error"`
-	Message string          `json:"message"`
-	Code    json.RawMessage `json:"code"`
-	Status  string          `json:"status"`
+	Type        string               `json:"type"`
+	EventType   string               `json:"event_type"`
+	Error       json.RawMessage      `json:"error"`
+	Message     string               `json:"message"`
+	Code        json.RawMessage      `json:"code"`
+	Status      string               `json:"status"`
+	Response    *streamErrorEnvelope `json:"response,omitempty"`
+	Interaction *streamErrorEnvelope `json:"interaction,omitempty"`
 }
 
 func inferHTTPStatus(typeStr, codeStr, statusStr string) int {
@@ -1624,7 +1964,53 @@ func inferHTTPStatus(typeStr, codeStr, statusStr string) int {
 	return 0
 }
 
+// isInteractionsFailureEnvelope reports whether an Interactions event carries a
+// provider failure. The failure detail is nested under "interaction", so without
+// this the stream is only marked blocked and the request never fails over.
+func isInteractionsFailureEnvelope(envelope streamErrorEnvelope) bool {
+	if strings.EqualFold(envelope.EventType, "interaction.failed") || strings.EqualFold(envelope.Type, "interaction.failed") {
+		return true
+	}
+	if envelope.Interaction == nil {
+		return false
+	}
+	if len(envelope.Interaction.Error) > 0 && !bytes.Equal(envelope.Interaction.Error, []byte("null")) {
+		return true
+	}
+	return strings.EqualFold(envelope.Interaction.Status, "failed")
+}
+
 func parseStreamErrorFromEnvelope(data []byte, envelope streamErrorEnvelope) *Error {
+	if envelope.Interaction != nil {
+		if (len(envelope.Error) == 0 || bytes.Equal(envelope.Error, []byte("null"))) && len(envelope.Interaction.Error) > 0 {
+			envelope.Error = envelope.Interaction.Error
+		}
+		if envelope.Message == "" {
+			envelope.Message = envelope.Interaction.Message
+		}
+		if len(envelope.Code) == 0 {
+			envelope.Code = envelope.Interaction.Code
+		}
+	}
+
+	if envelope.Response != nil {
+		if (len(envelope.Error) == 0 || bytes.Equal(envelope.Error, []byte("null"))) && len(envelope.Response.Error) > 0 {
+			envelope.Error = envelope.Response.Error
+		}
+		if envelope.Message == "" {
+			envelope.Message = envelope.Response.Message
+		}
+		if len(envelope.Code) == 0 {
+			envelope.Code = envelope.Response.Code
+		}
+		if envelope.Status == "" {
+			envelope.Status = envelope.Response.Status
+		}
+		if (envelope.Type == "" || strings.EqualFold(envelope.Type, "response.failed")) && envelope.Response.Type != "" {
+			envelope.Type = envelope.Response.Type
+		}
+	}
+
 	var detail struct {
 		Message string          `json:"message"`
 		Type    string          `json:"type"`
@@ -1700,7 +2086,10 @@ func parseStreamErrorFromEnvelope(data []byte, envelope streamErrorEnvelope) *Er
 		code = envelope.Type
 	}
 
-	status := rawCodeInt
+	status := 0
+	if rawCodeInt >= 100 && rawCodeInt <= 599 {
+		status = rawCodeInt
+	}
 	statusStr := strings.TrimSpace(detail.Status)
 	if statusStr == "" {
 		statusStr = strings.TrimSpace(envelope.Status)
@@ -1758,8 +2147,16 @@ func evalProviderError(data []byte, sseEvent string) *Error {
 		if err := json.Unmarshal(trimmed, &envelope); err == nil {
 			if len(envelope.Error) > 0 && !bytes.Equal(envelope.Error, []byte("null")) {
 				isError = true
-			} else if strings.EqualFold(envelope.Type, "error") {
+			} else if strings.EqualFold(envelope.Type, "error") || strings.EqualFold(envelope.Type, "response.failed") {
 				isError = true
+			} else if isInteractionsFailureEnvelope(envelope) {
+				isError = true
+			} else if envelope.Response != nil {
+				if len(envelope.Response.Error) > 0 && !bytes.Equal(envelope.Response.Error, []byte("null")) {
+					isError = true
+				} else if strings.EqualFold(envelope.Response.Type, "error") || strings.EqualFold(envelope.Response.Status, "failed") {
+					isError = true
+				}
 			}
 		}
 	}
@@ -1771,33 +2168,173 @@ func evalProviderError(data []byte, sseEvent string) *Error {
 	return parseStreamErrorFromEnvelope(trimmed, envelope)
 }
 
-func detectStreamPayloadError(payload []byte) *Error {
-	trimmed := bytes.TrimSpace(payload)
-	if len(trimmed) == 0 {
+type streamPayloadErrorDetector struct {
+	pending      []byte
+	dataLines    [][]byte
+	currentEvent string
+	err          *Error
+}
+
+func (d *streamPayloadErrorDetector) Observe(chunk []byte) *Error {
+	if d.err != nil {
+		return d.err
+	}
+	if len(chunk) == 0 {
 		return nil
 	}
-	if isSSEPayload(trimmed) {
-		var currentEvent string
-		for _, line := range bytes.Split(trimmed, []byte("\n")) {
-			line = bytes.TrimSpace(line)
-			if len(line) == 0 {
-				currentEvent = ""
+	d.pending = append(d.pending, chunk...)
+	for {
+		newline := bytes.IndexByte(d.pending, '\n')
+		if newline < 0 {
+			break
+		}
+		line := bytes.TrimSpace(d.pending[:newline])
+		d.pending = d.pending[newline+1:]
+		if len(line) == 0 {
+			if len(d.dataLines) > 0 && classifyJSONBuffer(bytes.Join(d.dataLines, []byte("\n"))) == jsonBufIncomplete {
+				// Blank line inside a pretty-printed raw JSON frame: keep buffering
+				// the frame so the closing line is appended before evaluation.
 				continue
 			}
-			if bytes.HasPrefix(line, []byte("event:")) {
-				currentEvent = strings.TrimSpace(string(bytes.TrimPrefix(line, []byte("event:"))))
-				continue
+			d.flushData()
+			if d.err != nil {
+				return d.err
 			}
-			if bytes.HasPrefix(line, []byte("data:")) {
-				data := parseSSEDataLine(line)
-				if err := evalProviderError(data, currentEvent); err != nil {
-					return err
+			continue
+		}
+		d.processLine(line)
+		if d.err != nil {
+			return d.err
+		}
+	}
+	trimmed := bytes.TrimSpace(d.pending)
+	if len(trimmed) > 0 && !isSSEPrefix(trimmed) && !couldBeSSEPrefix(trimmed) {
+		if classifyJSONBuffer(trimmed) == jsonBufComplete {
+			if values, err := decodeJSONValues(trimmed); err == nil {
+				for _, v := range values {
+					if streamErr := evalProviderError(v, ""); streamErr != nil {
+						d.err = streamErr
+						d.pending = d.pending[:0]
+						return d.err
+					}
 				}
+				d.pending = d.pending[:0]
 			}
 		}
-		return nil
 	}
-	return evalProviderError(trimmed, "")
+	return d.err
+}
+
+func (d *streamPayloadErrorDetector) processLine(line []byte) {
+	switch {
+	case bytes.HasPrefix(line, []byte("event:")):
+		d.currentEvent = strings.TrimSpace(string(bytes.TrimPrefix(line, []byte("event:"))))
+	case bytes.Equal(line, []byte("event")):
+	case bytes.HasPrefix(line, []byte("id:")), bytes.HasPrefix(line, []byte("retry:")), bytes.HasPrefix(line, []byte(":")):
+	case bytes.Equal(line, []byte("id")), bytes.Equal(line, []byte("retry")):
+	case bytes.HasPrefix(line, []byte("data:")):
+		d.dataLines = append(d.dataLines, parseSSEDataLine(line))
+	case bytes.Equal(line, []byte("data")):
+		d.dataLines = append(d.dataLines, []byte(""))
+	case bytes.HasPrefix(line, []byte("{")), bytes.HasPrefix(line, []byte("[")):
+		// Same JSONL/NDJSON framing as the bootstrap detector: a self-contained
+		// frame is never followed by a blank line, so evaluate it now instead of
+		// buffering it until a separator that will not arrive.
+		if len(d.dataLines) == 0 && classifyJSONBuffer(line) == jsonBufComplete {
+			d.evalCompleteJSONLine(line)
+			return
+		}
+		d.dataLines = append(d.dataLines, line)
+	default:
+		// Mirror of the bootstrap detector: a pretty-printed raw JSON frame must
+		// append the closing line first, then classify the joined buffer, and
+		// evaluate immediately when it becomes complete.
+		if len(d.dataLines) > 0 {
+			d.dataLines = append(d.dataLines, line)
+			joined := bytes.Join(d.dataLines, []byte("\n"))
+			d.dataLines = nil
+			switch classifyJSONBuffer(joined) {
+			case jsonBufComplete:
+				d.evalCompleteJSONLine(joined)
+			case jsonBufIncomplete:
+				// Still incomplete; restore and wait for the next line.
+				d.dataLines = [][]byte{joined}
+			}
+			return
+		}
+		if classifyJSONBuffer(line) == jsonBufComplete {
+			d.evalCompleteJSONLine(line)
+		}
+	}
+}
+
+func (d *streamPayloadErrorDetector) evalCompleteJSONLine(line []byte) {
+	values, err := decodeJSONValues(line)
+	if err != nil {
+		if streamErr := evalProviderError(line, ""); streamErr != nil {
+			d.err = streamErr
+		}
+		return
+	}
+	for _, v := range values {
+		if streamErr := evalProviderError(v, ""); streamErr != nil {
+			d.err = streamErr
+			return
+		}
+	}
+}
+
+func (d *streamPayloadErrorDetector) flushData() {
+	if len(d.dataLines) == 0 {
+		return
+	}
+	data := bytes.Join(d.dataLines, []byte("\n"))
+	currentEvent := d.currentEvent
+	d.dataLines = nil
+	d.currentEvent = ""
+	if bytes.Equal(data, []byte("[DONE]")) {
+		return
+	}
+	if len(data) == 0 {
+		return
+	}
+	if err := evalProviderError(data, currentEvent); err != nil {
+		d.err = err
+	}
+}
+
+func (d *streamPayloadErrorDetector) Finish() *Error {
+	if d.err != nil {
+		return d.err
+	}
+	if len(d.pending) > 0 {
+		trimmed := bytes.TrimSpace(d.pending)
+		d.pending = d.pending[:0]
+		if len(trimmed) > 0 {
+			if !isSSEPrefix(trimmed) && !couldBeSSEPrefix(trimmed) && classifyJSONBuffer(trimmed) == jsonBufComplete {
+				if values, err := decodeJSONValues(trimmed); err == nil {
+					for _, v := range values {
+						if err := evalProviderError(v, ""); err != nil {
+							d.err = err
+							return d.err
+						}
+					}
+				}
+			} else {
+				d.processLine(trimmed)
+			}
+		}
+	}
+	d.flushData()
+	return d.err
+}
+
+func detectStreamPayloadError(payload []byte) *Error {
+	var d streamPayloadErrorDetector
+	if err := d.Observe(payload); err != nil {
+		return err
+	}
+	return d.Finish()
 }
 
 type jsonBufferStatus int
@@ -1926,6 +2463,12 @@ func isEmptyCompletionPayload(payload []byte) bool {
 	}
 
 	acc.evalJSON(trimmed)
+	// A complete non-SSE OpenAI chat completion body is terminal by
+	// construction: zero-choice payloads such as {"choices":[]} or
+	// {"choices":[],"usage":null} never enter the per-choice terminal paths,
+	// so without this they would be accepted as successful responses instead
+	// of being judged as empty completions. Other recognized shapes (for
+	// example Claude messages) keep their per-shape terminal rules.
 	var probe struct {
 		Choices json.RawMessage `json:"choices"`
 	}
