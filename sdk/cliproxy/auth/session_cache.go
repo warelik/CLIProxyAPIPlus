@@ -139,6 +139,49 @@ func (c *SessionCache) SetAliases(authID string, sessionIDs ...string) {
 	c.setAliasesUntil(authID, time.Now().Add(c.ttl), sessionIDs...)
 }
 
+// SetAliasGroupIfAbsent binds all sessionIDs to authID only if none of the
+// sessionIDs are currently live. It returns the existing authID if any alias
+// is already live and false. Otherwise it sets the group and returns
+// (authID, true).
+func (c *SessionCache) SetAliasGroupIfAbsent(authID string, sessionIDs ...string) (string, bool) {
+	if c == nil || authID == "" || len(sessionIDs) == 0 {
+		return "", false
+	}
+	now := time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var liveAuthID string
+	for _, sid := range sessionIDs {
+		if sid == "" {
+			continue
+		}
+		if entry, ok := c.entries[sid]; ok && now.Before(entry.expiresAt) {
+			liveAuthID = entry.authID
+			break
+		}
+	}
+	if liveAuthID != "" {
+		return liveAuthID, false
+	}
+
+	aliases := compactSessionAliases(sessionIDs)
+	if len(aliases) == 0 {
+		return "", false
+	}
+	c.generation++
+	entry := sessionEntry{
+		authID:     authID,
+		expiresAt:  now.Add(c.ttl),
+		aliases:    aliases,
+		generation: c.generation,
+	}
+	for _, alias := range aliases {
+		c.entries[alias] = entry
+	}
+	return authID, true
+}
+
 // RestoreAliasesIfAbsent atomically sets the still-absent aliases to authID.
 // Any alias that is currently live (bound to another active group) is left untouched.
 // Returns true if at least one alias was restored, false otherwise.

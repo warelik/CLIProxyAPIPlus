@@ -718,6 +718,12 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		}
 		s.cache.Set(cacheKey, authID)
 	}
+	bindIfAbsent := func(authID string) (string, bool) {
+		if fallbackKey != "" {
+			return s.cache.SetAliasGroupIfAbsent(authID, cacheKey, fallbackKey)
+		}
+		return s.cache.SetAliasGroupIfAbsent(authID, cacheKey)
+	}
 
 	collectTempFallbackKeys := func() []string {
 		keys := []string{cacheKey}
@@ -823,6 +829,31 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	if err != nil {
 		return nil, err
 	}
+
+	// Avoid concurrent cache-miss picks from binding different auths.
+	// Only the first goroutine to set the alias group wins; the rest
+	// re-observe the binding and return the same auth.
+	if boundAuthID, ok := bindIfAbsent(auth.ID); !ok {
+		if boundAuthID != "" {
+			for _, a := range available {
+				if a.ID == boundAuthID {
+					auth = a
+					break
+				}
+			}
+		}
+		if auth.ID != boundAuthID && boundAuthID != "" {
+			// The actually-bound auth is no longer available. Keep our
+			// fallback pick and bind it explicitly.
+			bind(auth.ID)
+			entry.Infof("session-affinity: cache miss, concurrent binding unavailable, rebinding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+			return auth, nil
+		}
+		bind(auth.ID)
+		entry.Infof("session-affinity: cache miss, concurrent binding resolved | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+		return auth, nil
+	}
+
 	bind(auth.ID)
 	entry.Infof("session-affinity: cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 	return auth, nil
