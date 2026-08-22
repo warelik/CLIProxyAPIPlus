@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"sync"
 	"testing"
@@ -534,6 +535,185 @@ func TestClaudeThinkingReplayAliasHomeEvictionSkipsReaddedAlias(t *testing.T) {
 
 	if _, ok := client.values[client.evicted]; !ok {
 		t.Fatalf("evicted alias %q was deleted while re-added to index", client.evicted)
+	}
+}
+
+func TestClaudeThinkingReplayAliasHomeRechecksEvictedAliasValue(t *testing.T) {
+	ClearClaudeThinkingReplayCache()
+	defer ClearClaudeThinkingReplayCache()
+
+	ctx := context.Background()
+	const modelFamily = "claude:test"
+	indexKey := claudeThinkingReplayAliasIndexKVKey(modelFamily)
+
+	client := newFakeClaudeThinkingReplayKVClient()
+	useFakeClaudeThinkingReplayKVClient(t, client, true)
+
+	max := ClaudeThinkingReplayCacheMaxAliasesPerCredential
+	now := time.Now()
+	var index claudeThinkingReplayAliasIndex
+	for i := 0; i < max; i++ {
+		aliasKey := claudeThinkingReplayAliasKVKey(modelFamily, messageHashFor(i))
+		index.Aliases = append(index.Aliases, claudeThinkingReplayAliasIndexRecord{
+			AliasKey:  aliasKey,
+			Timestamp: now.Add(-time.Duration(max-i) * time.Second),
+		})
+		value, _ := json.Marshal(claudeThinkingReplayAliasHomeValue{
+			Sessions: []claudeThinkingReplayAliasHomeSession{
+				{SessionKey: "session", FirstUserHash: "first", Timestamp: now},
+			},
+		})
+		client.values[aliasKey] = value
+	}
+	evictedAlias := index.Aliases[0].AliasKey
+	indexBytes, _ := json.Marshal(index)
+	client.values[indexKey] = indexBytes
+
+	// Simulate a concurrent worker refreshing the evicted alias value after the
+	// index record was established but before the eviction pass.
+	refreshed, _ := json.Marshal(claudeThinkingReplayAliasHomeValue{
+		Sessions: []claudeThinkingReplayAliasHomeSession{
+			{SessionKey: "session", FirstUserHash: "first", Timestamp: now.Add(time.Minute)},
+		},
+	})
+	client.values[evictedAlias] = refreshed
+
+	RegisterClaudeThinkingReplayAlias(ctx, modelFamily, "session", messageHashFor(max), "first")
+
+	if _, ok := client.values[evictedAlias]; !ok {
+		t.Fatalf("evicted alias %q was deleted despite a repopulated value", evictedAlias)
+	}
+}
+
+// indexGetFailingClaudeThinkingReplayKVClient fails KVGet for the index key.
+// This verifies rollback does not depend on an index read succeeding.
+type indexGetFailingClaudeThinkingReplayKVClient struct {
+	*fakeClaudeThinkingReplayKVClient
+	indexKey string
+}
+
+func (c *indexGetFailingClaudeThinkingReplayKVClient) KVGet(ctx context.Context, key string) ([]byte, bool, error) {
+	if key == c.indexKey {
+		return nil, false, fmt.Errorf("simulated index read failure")
+	}
+	return c.fakeClaudeThinkingReplayKVClient.KVGet(ctx, key)
+}
+
+func TestClaudeThinkingReplayAliasHomeRollbackConditionalOnCommittedValue(t *testing.T) {
+	ClearClaudeThinkingReplayCache()
+	defer ClearClaudeThinkingReplayCache()
+
+	ctx := context.Background()
+	const modelFamily = "claude:test"
+	indexKey := claudeThinkingReplayAliasIndexKVKey(modelFamily)
+	messageHash := "new-msg"
+	aliasKey := claudeThinkingReplayAliasKVKey(modelFamily, messageHash)
+
+	base := newFakeClaudeThinkingReplayKVClient()
+	client := &indexGetFailingClaudeThinkingReplayKVClient{
+		fakeClaudeThinkingReplayKVClient: base,
+		indexKey:                         indexKey,
+	}
+	useFakeClaudeThinkingReplayKVClient(t, client, true)
+
+	RegisterClaudeThinkingReplayAlias(ctx, modelFamily, "session", messageHash, "first")
+
+	if _, ok := client.values[aliasKey]; ok {
+		t.Fatalf("alias %q was committed but not indexed; expected rollback conditional on committed value", aliasKey)
+	}
+}
+
+// erroredAliasCASClaudeThinkingReplayKVClient simulates an alias CAS that
+// returns an error after the value was already applied, leaving a partial
+// registration that must be rolled back.
+type erroredAliasCASClaudeThinkingReplayKVClient struct {
+	*fakeClaudeThinkingReplayKVClient
+	aliasKey string
+	errored  bool
+}
+
+func (c *erroredAliasCASClaudeThinkingReplayKVClient) KVCompareAndSwap(ctx context.Context, key string, expected []byte, expectedExists bool, newValue []byte, ttl time.Duration) (bool, error) {
+	if key == c.aliasKey && !c.errored {
+		c.errored = true
+		c.values[key] = append([]byte(nil), newValue...)
+		return false, fmt.Errorf("simulated alias CAS error")
+	}
+	return c.fakeClaudeThinkingReplayKVClient.KVCompareAndSwap(ctx, key, expected, expectedExists, newValue, ttl)
+}
+
+func TestClaudeThinkingReplayAliasHomeRollBackOnFailedRegistration(t *testing.T) {
+	ClearClaudeThinkingReplayCache()
+	defer ClearClaudeThinkingReplayCache()
+
+	ctx := context.Background()
+	const modelFamily = "claude:test"
+	messageHash := "new-msg"
+	aliasKey := claudeThinkingReplayAliasKVKey(modelFamily, messageHash)
+
+	base := newFakeClaudeThinkingReplayKVClient()
+	client := &erroredAliasCASClaudeThinkingReplayKVClient{
+		fakeClaudeThinkingReplayKVClient: base,
+		aliasKey:                         aliasKey,
+	}
+	useFakeClaudeThinkingReplayKVClient(t, client, true)
+
+	RegisterClaudeThinkingReplayAlias(ctx, modelFamily, "session", messageHash, "first")
+
+	if _, ok := client.values[aliasKey]; ok {
+		t.Fatalf("alias %q was left after a failed CAS; expected rollback", aliasKey)
+	}
+}
+
+func TestClaudeThinkingReplayAliasEnforcesByteLimitAndLRU(t *testing.T) {
+	ClearClaudeThinkingReplayCache()
+	ctx := context.Background()
+
+	// The byte limit is large; construct an alias with a very long modelFamily
+	// to push the aggregate size over the cap.
+	large := make([]byte, ClaudeThinkingReplayCacheMaxAliasBytes)
+	for i := range large {
+		large[i] = 'x'
+	}
+	modelFamily := "claude:" + string(large) + ":model"
+
+	RegisterClaudeThinkingReplayAlias(ctx, modelFamily, "session-a", "msg", "first")
+	RegisterClaudeThinkingReplayAlias(ctx, modelFamily, "session-b", "msg2", "first")
+
+	if claudeThinkingReplayAliasBytes > ClaudeThinkingReplayCacheMaxAliasBytes {
+		t.Fatalf("alias bytes %d still over the %d cap after enforcement", claudeThinkingReplayAliasBytes, ClaudeThinkingReplayCacheMaxAliasBytes)
+	}
+}
+
+func TestClaudeThinkingReplayAliasPerKeyEvictsOldestByTimestamp(t *testing.T) {
+	ClearClaudeThinkingReplayCache()
+	ctx := context.Background()
+
+	modelFamily := "claude:cred:model"
+	messageHash := "shared-msg"
+
+	// Fill the per-key list with 8 sessions, each with a distinct timestamp.
+	for i := 0; i < ClaudeThinkingReplayCacheMaxAliasesPerKey; i++ {
+		useFakeClaudeThinkingReplayKVClient(t, newFakeClaudeThinkingReplayKVClient(), false)
+		RegisterClaudeThinkingReplayAlias(ctx, modelFamily, fmt.Sprintf("session-%d", i), messageHash, "first")
+	}
+
+	// Refresh the oldest one (session-0) so it becomes newest.
+	useFakeClaudeThinkingReplayKVClient(t, newFakeClaudeThinkingReplayKVClient(), false)
+	RegisterClaudeThinkingReplayAlias(ctx, modelFamily, "session-0", messageHash, "first")
+
+	// Add one more. The oldest remaining by timestamp should be session-1.
+	useFakeClaudeThinkingReplayKVClient(t, newFakeClaudeThinkingReplayKVClient(), false)
+	RegisterClaudeThinkingReplayAlias(ctx, modelFamily, "session-9", messageHash, "first")
+
+	key := claudeThinkingReplayAliasKey(modelFamily, messageHash)
+	list := claudeThinkingReplayAliases[key]
+	for _, e := range list {
+		if e.sessionKey == "session-1" {
+			t.Fatalf("session-1 should have been evicted as oldest after session-0 refresh")
+		}
+	}
+	if len(list) != ClaudeThinkingReplayCacheMaxAliasesPerKey {
+		t.Fatalf("per-key list len = %d, want %d", len(list), ClaudeThinkingReplayCacheMaxAliasesPerKey)
 	}
 }
 

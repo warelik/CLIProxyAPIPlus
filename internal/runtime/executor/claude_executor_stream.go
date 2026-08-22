@@ -50,6 +50,10 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	if claudeThinkingReplayEnabled(auth, req, opts) {
 		replayScope, replayContents, _ = prepareClaudeThinkingReplayRequest(ctx, auth, req, opts)
 	}
+	var replayAccum *kimiThinkingReplayStreamAccumulator
+	if replayScope.valid() && responseFormat != to {
+		replayAccum = newKimiThinkingReplayStreamAccumulator()
+	}
 	defer func() {
 		if err != nil && replayScope.replayApplied && shouldClearKimiThinkingReplayAfterError(err) {
 			clearClaudeThinkingReplayContent(ctx, replayScope)
@@ -394,6 +398,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				return
 			}
 			line = e.restoreResponseModel(restoredLine, req.Model)
+			if replayAccum != nil {
+				replayAccum.observe(line)
+			}
 			chunks := sdktranslator.TranslateStream(
 				ctx,
 				to,
@@ -433,6 +440,11 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		}
 		if upstreamCompleted {
 			commitClaudeDiagnostics(diagnosticsState, upstreamMessageID)
+		}
+		if replayAccum != nil && upstreamCompleted {
+			if content, completed := replayAccum.content(); completed {
+				cacheClaudeThinkingReplayContent(ctx, replayScope, content)
+			}
 		}
 	}()
 	result := &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}
