@@ -92,6 +92,47 @@ func useFakeClaudeThinkingReplayKVClient(t *testing.T, client kimiThinkingReplay
 	})
 }
 
+func TestClaudeThinkingReplayGetWithSnapshotDoesNotReserveHomeKV(t *testing.T) {
+	ClearClaudeThinkingReplayCache()
+	defer ClearClaudeThinkingReplayCache()
+
+	fake := newFakeClaudeThinkingReplayKVClient()
+	useFakeClaudeThinkingReplayKVClient(t, fake, true)
+
+	ctx := context.Background()
+	const modelFamily = "claude:test"
+
+	// A read-only request for an unknown session must not reserve a Home KV
+	// tombstone, otherwise every no-nonce opening would create an unbounded KV
+	// entry even when upstream rejects the request.
+	_, _, found, err := GetClaudeThinkingReplayWithSnapshotRequired(ctx, modelFamily, "session-1")
+	if err != nil {
+		t.Fatalf("GetClaudeThinkingReplayWithSnapshotRequired: %v", err)
+	}
+	if found {
+		t.Fatal("expected not found for unknown session")
+	}
+	if len(fake.values) != 0 {
+		t.Fatalf("Get reserved state for unknown session: %d values", len(fake.values))
+	}
+
+	// After a successful response is stored, the session can be read back.
+	content := []byte(`[{"type":"thinking","thinking":"r","signature":"EgI="},{"type":"text","text":"ok"}]`)
+	if !CacheClaudeThinkingReplayBestEffort(ctx, modelFamily, "session-1", content) {
+		t.Fatal("CacheClaudeThinkingReplayBestEffort failed")
+	}
+	got, _, found, err := GetClaudeThinkingReplayWithSnapshotRequired(ctx, modelFamily, "session-1")
+	if err != nil {
+		t.Fatalf("GetClaudeThinkingReplayWithSnapshotRequired after cache: %v", err)
+	}
+	if !found {
+		t.Fatal("expected found after cache")
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 cached content, got %d", len(got))
+	}
+}
+
 func TestResolveClaudeThinkingReplayAliasScoresByWeightAndFirstUser(t *testing.T) {
 	ClearClaudeThinkingReplayCache()
 	defer ClearClaudeThinkingReplayCache()

@@ -43,10 +43,6 @@ func ConvertClaudeRequestToGeminiWithCompat(modelName string, inputRawJSON []byt
 func convertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool, preserveEmptyThinkingBlocks bool) []byte {
 	rawJSON := inputRawJSON
 	// Build output Gemini request JSON
-	// Claude cache_control markers have no direct Gemini equivalent. Gemini 2.5+
-	// uses implicit context caching; explicit caching requires a separately
-	// created cachedContent resource. We intentionally drop cache_control from
-	// tools, system instructions, and message contents to avoid unsupported fields.
 	out := []byte(`{"contents":[]}`)
 	out, _ = sjson.SetBytes(out, "model", modelName)
 
@@ -123,13 +119,17 @@ func convertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool,
 							return true
 						}
 						rawSignature := contentResult.Get("signature").String()
-						replaySignature := rawSignature
-						if strings.TrimSpace(rawSignature) != "" {
-							replaySignature = sigcompat.GeminiReplaySignatureOrBypass(rawSignature, sigcompat.SignatureBlockKindGeminiModelPart)
+						thoughtSignature := rawSignature
+						if rawSignature != "" {
+							if sig, ok := sigcompat.CompatibleSignatureForProvider(sigcompat.SignatureProviderGemini, rawSignature); ok {
+								thoughtSignature = sig
+							} else {
+								thoughtSignature = geminiClaudeThoughtSignature
+							}
 						}
 						part := []byte(`{"text":"","thought":true,"thoughtSignature":""}`)
 						part, _ = sjson.SetBytes(part, "text", contentResult.Get("thinking").String())
-						part, _ = sjson.SetBytes(part, "thoughtSignature", replaySignature)
+						part, _ = sjson.SetBytes(part, "thoughtSignature", thoughtSignature)
 						partItems = append(partItems, part)
 
 					case "tool_use":
