@@ -10,6 +10,7 @@ import (
 
 	internalcache "github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
@@ -64,7 +65,7 @@ func TestRestoreKimiThinkingReplayContentPreservesCompleteAssistantContent(t *te
 		t.Fatal("expected cached thinking content to be restored")
 	}
 	got := gjson.GetBytes(updated, "messages.1.content")
-	if !kimiJSONEqual([]byte(got.Raw), cached) {
+	if !helps.JSONEqual([]byte(got.Raw), cached) {
 		t.Fatalf("restored content = %s, want complete cached content %s", got.Raw, cached)
 	}
 }
@@ -77,8 +78,54 @@ func TestRestoreKimiThinkingReplayContentDoesNotReplaceExistingThinking(t *testi
 	if restored {
 		t.Fatalf("existing thinking must not be replaced: %s", updated)
 	}
-	if !kimiJSONEqual(updated, body) {
+	if !helps.JSONEqual(updated, body) {
 		t.Fatalf("request changed despite existing thinking: got %s want %s", updated, body)
+	}
+}
+
+func TestRestoreKimiThinkingReplayContentRejectsDuplicateUnsignedCandidates(t *testing.T) {
+	cached := []byte(`[{"type":"thinking","thinking":"cached","signature":"cached-signature"},{"type":"text","text":"OK"}]`)
+	// The earlier assistant is the retained signed turn, the later one is a
+	// new unsigned duplicate with the same visible text. The reverse scan must
+	// not restore the cached signature into the later duplicate.
+	body := []byte(`{"messages":[
+		{"role":"user","content":"hi"},
+		{"role":"assistant","content":[{"type":"text","text":"OK"}]},
+		{"role":"user","content":"again"},
+		{"role":"assistant","content":[{"type":"text","text":"OK"}]}
+	]}`)
+
+	updated, restored := restoreKimiThinkingReplayContent(body, cached)
+	if restored {
+		t.Fatalf("duplicate unsigned candidates must not be restored: %s", updated)
+	}
+	if !helps.JSONEqual(updated, body) {
+		t.Fatalf("request body changed when it should not: %s", updated)
+	}
+}
+
+func TestRestoreKimiThinkingReplayContentPrefersRetainedDuplicate(t *testing.T) {
+	cached := []byte(`[{"type":"thinking","thinking":"cached","signature":"cached-signature"},{"type":"text","text":"OK"}]`)
+	// Two matching assistants; the earlier one still carries the cached
+	// thinking (retained), the later one is an unsigned duplicate. The
+	// retained turn should receive the signature.
+	body := []byte(`{"messages":[
+		{"role":"user","content":"hi"},
+		{"role":"assistant","content":[{"type":"thinking","thinking":"cached","signature":"existing-signature"},{"type":"text","text":"OK"}]},
+		{"role":"user","content":"again"},
+		{"role":"assistant","content":[{"type":"text","text":"OK"}]}
+	]}`)
+
+	updated, restored := restoreKimiThinkingReplayContent(body, cached)
+	if !restored {
+		t.Fatal("expected restore for retained duplicate")
+	}
+	// The retained turn is at index 1; the later duplicate at index 3 stays unsigned.
+	if sig := gjson.GetBytes(updated, "messages.1.content.0.signature").String(); sig != "cached-signature" {
+		t.Fatalf("retained assistant got signature %q, want cached-signature", sig)
+	}
+	if sig := gjson.GetBytes(updated, "messages.3.content.0.signature").String(); sig != "" {
+		t.Fatalf("later duplicate should remain unsigned, got signature %q", sig)
 	}
 }
 
@@ -202,7 +249,7 @@ func TestKimiExecutorClaudeNonStreamReplaysThinkingAcrossK3VariantSwitch(t *test
 		t.Fatalf("upstream request count = %d, want 2", len(upstreamBodies))
 	}
 	gotContent := gjson.GetBytes(upstreamBodies[1], "messages.1.content")
-	if !kimiJSONEqual([]byte(gotContent.Raw), []byte(cachedContent)) {
+	if !helps.JSONEqual([]byte(gotContent.Raw), []byte(cachedContent)) {
 		t.Fatalf("second upstream assistant content = %s, want %s", gotContent.Raw, cachedContent)
 	}
 	if _, found, errGet := internalcache.GetKimiThinkingReplayRequired(context.Background(), "k3", "execution:nonstream-switch"); errGet != nil || found {
@@ -426,7 +473,7 @@ func TestKimiThinkingReplayUnknownStreamDeltaPreservesPreviousCache(t *testing.T
 	consumeKimiReplayStream(t, wrapKimiThinkingReplayStream(context.Background(), &cliproxyexecutor.StreamResult{Chunks: chunks}, scope))
 
 	got, found, errGet := internalcache.GetKimiThinkingReplayRequired(context.Background(), "k3", sessionKey)
-	if errGet != nil || !found || !kimiJSONEqual(got, cached) {
+	if errGet != nil || !found || !helps.JSONEqual(got, cached) {
 		t.Fatalf("unknown successful delta changed previous cache: got %s, found %v, error %v", got, found, errGet)
 	}
 }

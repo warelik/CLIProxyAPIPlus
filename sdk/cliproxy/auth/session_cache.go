@@ -219,6 +219,72 @@ func (c *SessionCache) RestoreAliasesIfAbsent(authID string, sessionIDs ...strin
 	return true
 }
 
+// SetAliasesIfAllAbsent atomically binds all sessionIDs to authID only when every
+// alias is currently absent or expired. If any alias is already live, it returns
+// the authID currently bound to the first occupied alias and false, without
+// modifying anything. This prevents a cold binding from splitting an existing
+// affinity group when one key is already occupied.
+func (c *SessionCache) SetAliasesIfAllAbsent(authID string, sessionIDs ...string) (string, bool) {
+	if c == nil || authID == "" || len(sessionIDs) == 0 {
+		return "", false
+	}
+	now := time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var absent []string
+	for _, sid := range sessionIDs {
+		if sid == "" {
+			continue
+		}
+		if entry, ok := c.entries[sid]; ok && now.Before(entry.expiresAt) {
+			return entry.authID, false
+		}
+		absent = append(absent, sid)
+	}
+	aliases := compactSessionAliases(absent)
+	if len(aliases) == 0 {
+		return "", false
+	}
+	c.generation++
+	entry := sessionEntry{
+		authID:     authID,
+		expiresAt:  now.Add(c.ttl),
+		aliases:    aliases,
+		generation: c.generation,
+	}
+	for _, alias := range aliases {
+		c.entries[alias] = entry
+	}
+	return authID, true
+}
+
+// SetAliasesIfNoConflict atomically binds all sessionIDs to authID. It succeeds
+// when every alias is either absent or already bound to authID, attaching any
+// free aliases to the existing group. If any alias is bound to a different auth,
+// it returns that auth and false without modifying the cache. This combines the
+// occupied-alias check and the attachment under a single lock so a concurrent
+// request cannot bind a free alias to another auth between the two steps.
+func (c *SessionCache) SetAliasesIfNoConflict(authID string, sessionIDs ...string) (string, bool) {
+	if c == nil || authID == "" || len(sessionIDs) == 0 {
+		return "", false
+	}
+	now := time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for _, sid := range sessionIDs {
+		if sid == "" {
+			continue
+		}
+		if entry, ok := c.entries[sid]; ok && now.Before(entry.expiresAt) && entry.authID != authID {
+			return entry.authID, false
+		}
+	}
+	c.setAliasesUntilLocked(authID, now.Add(c.ttl), sessionIDs...)
+	return authID, true
+}
+
 func (c *SessionCache) setAliasesUntil(authID string, expiresAt time.Time, sessionIDs ...string) {
 	if authID == "" || expiresAt.IsZero() {
 		return
@@ -229,7 +295,11 @@ func (c *SessionCache) setAliasesUntil(authID string, expiresAt time.Time, sessi
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.setAliasesUntilLocked(authID, expiresAt, sessionIDs...)
+}
 
+func (c *SessionCache) setAliasesUntilLocked(authID string, expiresAt time.Time, sessionIDs ...string) {
+	now := time.Now()
 	aliases := mergeSessionAliases(nil, sessionIDs...)
 	previousGroups := make([]sessionEntry, 0, len(sessionIDs))
 	for _, sessionID := range sessionIDs {

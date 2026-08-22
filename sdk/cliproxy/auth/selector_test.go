@@ -1406,6 +1406,66 @@ func TestSessionCache_RestoreAliasesIfAbsent_IndependentRestoration(t *testing.T
 	}
 }
 
+func TestSessionCache_SetAliasesIfAllAbsent_HonorsOccupiedAlias(t *testing.T) {
+	cache := NewSessionCache(time.Minute)
+	defer cache.Stop()
+
+	cache.SetAliases("auth-a", "shared", "conv-a")
+
+	bound, ok := cache.SetAliasesIfAllAbsent("auth-b", "shared", "conv-b")
+	if ok {
+		t.Fatalf("SetAliasesIfAllAbsent must not succeed when an alias is occupied")
+	}
+	if bound != "auth-a" {
+		t.Fatalf("SetAliasesIfAllAbsent must return existing auth, got %q", bound)
+	}
+	if got, ok := cache.Get("conv-b"); ok {
+		t.Fatalf("conv-b must not be bound, got %q", got)
+	}
+	if got, ok := cache.Get("shared"); !ok || got != "auth-a" {
+		t.Fatalf("shared must remain auth-a, got %q, %v", got, ok)
+	}
+}
+
+func TestSessionCache_SetAliasesIfNoConflict(t *testing.T) {
+	cache := NewSessionCache(time.Minute)
+	defer cache.Stop()
+
+	// All absent: sets every alias to the requested auth.
+	bound, ok := cache.SetAliasesIfNoConflict("auth-a", "k1", "k2")
+	if !ok || bound != "auth-a" {
+		t.Fatalf("SetAliasesIfNoConflict should set all, got %q, %v", bound, ok)
+	}
+	if got, ok := cache.Get("k1"); !ok || got != "auth-a" {
+		t.Fatalf("k1 = %q, %v", got, ok)
+	}
+	if got, ok := cache.Get("k2"); !ok || got != "auth-a" {
+		t.Fatalf("k2 = %q, %v", got, ok)
+	}
+
+	// Partially occupied by same auth: attaches free alias.
+	bound, ok = cache.SetAliasesIfNoConflict("auth-a", "k2", "k3")
+	if !ok || bound != "auth-a" {
+		t.Fatalf("SetAliasesIfNoConflict should attach free alias, got %q, %v", bound, ok)
+	}
+	if got, ok := cache.Get("k3"); !ok || got != "auth-a" {
+		t.Fatalf("k3 should attach to auth-a, got %q, %v", got, ok)
+	}
+
+	// Occupied by different auth: returns conflict without modifying cache.
+	cache.SetAliases("auth-b", "k4")
+	bound, ok = cache.SetAliasesIfNoConflict("auth-c", "k4", "k5")
+	if ok {
+		t.Fatalf("SetAliasesIfNoConflict should fail on conflict")
+	}
+	if bound != "auth-b" {
+		t.Fatalf("SetAliasesIfNoConflict should return conflicting auth, got %q", bound)
+	}
+	if got, ok := cache.Get("k5"); ok {
+		t.Fatalf("k5 should not be bound, got %q", got)
+	}
+}
+
 func TestSessionAffinitySelector_ThreeScenarios(t *testing.T) {
 	t.Parallel()
 

@@ -8,8 +8,10 @@ import (
 	"encoding/json"
 	"hash"
 	"net/http"
+	"sort"
 	"strings"
 
+	claudeauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/claude"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/tidwall/gjson"
@@ -66,7 +68,7 @@ func ClaudeThinkingReplayConversationSessionKey(auth *cliproxyauth.Auth, req cli
 	if auth != nil {
 		if id := strings.TrimSpace(auth.ID); id != "" {
 			hashString(h, id)
-		} else if apiKey, _ := claudeCredentialKey(auth); apiKey != "" {
+		} else if apiKey, _ := ClaudeCredentialKey(auth); apiKey != "" {
 			hashString(h, apiKey)
 		} else {
 			hashString(h, "")
@@ -75,10 +77,10 @@ func ClaudeThinkingReplayConversationSessionKey(auth *cliproxyauth.Auth, req cli
 		hashString(h, "")
 	}
 
-	hashString(h, metadataString(opts.Metadata, cliproxyexecutor.CallerScopeMetadataKey))
-	hashString(h, metadataString(req.Metadata, cliproxyexecutor.CallerScopeMetadataKey))
-	hashString(h, metadataString(opts.Metadata, cliproxyexecutor.DerivedSessionIDMetadataKey))
-	hashString(h, metadataString(req.Metadata, cliproxyexecutor.DerivedSessionIDMetadataKey))
+	hashString(h, MetadataString(opts.Metadata, cliproxyexecutor.CallerScopeMetadataKey))
+	hashString(h, MetadataString(req.Metadata, cliproxyexecutor.CallerScopeMetadataKey))
+	hashString(h, MetadataString(opts.Metadata, cliproxyexecutor.DerivedSessionIDMetadataKey))
+	hashString(h, MetadataString(req.Metadata, cliproxyexecutor.DerivedSessionIDMetadataKey))
 
 	// Read identity headers case-insensitively so callers that supply lowercase
 	// keys (e.g. x-codex-client-id) are not collapsed with missing values.
@@ -112,15 +114,26 @@ func ClaudeThinkingReplayConversationSessionKey(auth *cliproxyauth.Auth, req cli
 }
 
 // headerFirstValue returns the first non-empty, trimmed value for key from
-// headers, matching the key case-insensitively to tolerate callers that use
-// lowercase header names. Whitespace-only values are treated as missing.
+// headers, matching the key case-insensitively. Matching header names are
+// collected and sorted so the same logical header under multiple casings always
+// returns the same value. Whitespace-only values are treated as missing.
 func headerFirstValue(headers http.Header, key string) string {
 	if headers == nil {
 		return ""
 	}
-	for k, vv := range headers {
-		if strings.EqualFold(k, key) && len(vv) > 0 {
-			if v := strings.TrimSpace(vv[0]); v != "" {
+	var keys []string
+	for k := range headers {
+		if strings.EqualFold(k, key) {
+			keys = append(keys, k)
+		}
+	}
+	if len(keys) == 0 {
+		return ""
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		for _, v := range headers[k] {
+			if v := strings.TrimSpace(v); v != "" {
 				return v
 			}
 		}
@@ -142,15 +155,18 @@ func hashBytes(h hash.Hash, b []byte) {
 	h.Write(b)
 }
 
-// claudeCredentialKey returns the most identifying credential value available
+// ClaudeCredentialKey returns the most identifying credential value available
 // for an auth without importing the executor package.
-func claudeCredentialKey(auth *cliproxyauth.Auth) (apiKey, baseURL string) {
+func ClaudeCredentialKey(auth *cliproxyauth.Auth) (apiKey, baseURL string) {
 	if auth == nil {
 		return "", ""
 	}
 	if auth.Attributes != nil {
 		apiKey = auth.Attributes["api_key"]
 		baseURL = auth.Attributes["base_url"]
+	}
+	if apiKey == "" {
+		apiKey = claudeauth.ReadMetadataString(&auth.Metadata, "access_token")
 	}
 	return apiKey, baseURL
 }

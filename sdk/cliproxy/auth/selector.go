@@ -718,12 +718,6 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		}
 		s.cache.Set(cacheKey, authID)
 	}
-	bindIfAbsent := func(authID string) (string, bool) {
-		if fallbackKey != "" {
-			return s.cache.SetAliasGroupIfAbsent(authID, cacheKey, fallbackKey)
-		}
-		return s.cache.SetAliasGroupIfAbsent(authID, cacheKey)
-	}
 
 	collectTempFallbackKeys := func() []string {
 		keys := []string{cacheKey}
@@ -830,32 +824,26 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		return nil, err
 	}
 
-	// Avoid concurrent cache-miss picks from binding different auths.
-	// Only the first goroutine to set the alias group wins; the rest
-	// re-observe the binding and return the same auth.
-	if boundAuthID, ok := bindIfAbsent(auth.ID); !ok {
-		if boundAuthID != "" {
-			for _, a := range available {
-				if a.ID == boundAuthID {
-					auth = a
-					break
-				}
-			}
-		}
-		if auth.ID != boundAuthID && boundAuthID != "" {
-			// The actually-bound auth is no longer available. Keep our
-			// fallback pick and bind it explicitly.
-			bind(auth.ID)
-			entry.Infof("session-affinity: cache miss, concurrent binding unavailable, rebinding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
-			return auth, nil
-		}
-		bind(auth.ID)
-		entry.Infof("session-affinity: cache miss, concurrent binding resolved | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+	coldKeys := []string{cacheKey}
+	if fallbackKey != "" {
+		coldKeys = append(coldKeys, fallbackKey)
+	}
+	// Cold cache binding: atomically install the binding only when no alias is
+	// already bound to a different auth. Free aliases are attached to the same
+	// auth, so a later turn that retains only the conversation ID stays sticky.
+	boundAuth, ok := s.cache.SetAliasesIfNoConflict(auth.ID, coldKeys...)
+	if ok {
+		entry.Infof("session-affinity: cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 		return auth, nil
 	}
-
-	bind(auth.ID)
-	entry.Infof("session-affinity: cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+	if boundAuth != "" {
+		for _, a := range available {
+			if a.ID == boundAuth {
+				entry.Infof("session-affinity: cache miss, alias already bound to %s | session=%s provider=%s model=%s", a.ID, truncateSessionID(primaryID), provider, model)
+				return a, nil
+			}
+		}
+	}
 	return auth, nil
 }
 

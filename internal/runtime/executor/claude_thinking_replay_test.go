@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,7 @@ import (
 
 	internalcache "github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
@@ -53,6 +55,24 @@ func TestClaudeThinkingReplayScopeFromRequest_FallbackKeyOnlyForContent(t *testi
 	}
 }
 
+func TestCapClaudeThinkingReplayAliasMessages_KeepsFirstAndMostRecent(t *testing.T) {
+	var all []internalcache.ClaudeThinkingReplayAliasMessage
+	for i := 0; i < 100; i++ {
+		all = append(all, internalcache.ClaudeThinkingReplayAliasMessage{Hash: fmt.Sprintf("hash-%d", i)})
+	}
+	capped := capClaudeThinkingReplayAliasMessages(all)
+	if len(capped) != claudeThinkingReplayMaxAliasesPerRequest {
+		t.Fatalf("capped len = %d, want %d", len(capped), claudeThinkingReplayMaxAliasesPerRequest)
+	}
+	if capped[0].Hash != "hash-0" {
+		t.Fatalf("capped should keep first message, got %q", capped[0].Hash)
+	}
+	wantLast := "hash-99"
+	if capped[len(capped)-1].Hash != wantLast {
+		t.Fatalf("capped should keep most recent messages, got last %q, want %q", capped[len(capped)-1].Hash, wantLast)
+	}
+}
+
 func TestClaudeThinkingReplayFindStartIndex_RefusesPartialAnchor(t *testing.T) {
 	assistant := []gjson.Result{
 		gjson.Parse(`[{"type":"text","text":"A-old"}]`),
@@ -62,15 +82,137 @@ func TestClaudeThinkingReplayFindStartIndex_RefusesPartialAnchor(t *testing.T) {
 		[]byte(`[{"type":"text","text":"A-old"}]`),
 		[]byte(`[{"type":"text","text":"A-new"}]`),
 	}
-	if got := claudeThinkingReplayFindStartIndex(assistant, cached); got != -1 {
+	if got, _ := helps.ClaudeThinkingReplayFindStartIndex(assistant, cached); got != -1 {
 		t.Fatalf("expected -1 for partial match with unsigned trailing turn, got %d", got)
 	}
 
 	assistantFull := []gjson.Result{
 		gjson.Parse(`[{"type":"text","text":"A-new"}]`),
 	}
-	if got := claudeThinkingReplayFindStartIndex(assistantFull, cached); got != 1 {
-		t.Fatalf("expected latest full match start 1, got %d", got)
+	if got, off := helps.ClaudeThinkingReplayFindStartIndex(assistantFull, cached); got != 1 || len(off) != 1 || off[0] != 0 {
+		t.Fatalf("expected latest full match start 1 off [0], got %d %v", got, off)
+	}
+
+	// Cached turns separated by an uncached unsigned assistant should still
+	// anchor both retained turns.
+	body := []byte(`{"messages":[{"role":"user","content":"u"},{"role":"assistant","content":[{"type":"thinking","thinking":"r","signature":"sig1"},{"type":"text","text":"A"}]},{"role":"assistant","content":[{"type":"text","text":"X"}]},{"role":"assistant","content":[{"type":"thinking","thinking":"r","signature":"sig2"},{"type":"text","text":"B"}]},{"role":"user","content":"u2"}]}`)
+	retained := [][]byte{
+		[]byte(`[{"type":"thinking","thinking":"r","signature":"sig1"},{"type":"text","text":"A"}]`),
+		[]byte(`[{"type":"thinking","thinking":"r","signature":"sig2"},{"type":"text","text":"B"}]`),
+	}
+	updated, _ := helps.RestoreClaudeThinkingReplayContents(body, retained)
+	a := gjson.GetBytes(updated, "messages.1.content").Array()
+	unsignedX := gjson.GetBytes(updated, "messages.2.content").Array()
+	b := gjson.GetBytes(updated, "messages.3.content").Array()
+	if a[0].Get("signature").String() != "sig1" {
+		t.Fatalf("first retained turn should keep sig1, got %s", a[0].Get("signature").String())
+	}
+	if unsignedX[0].Get("signature").String() != "" {
+		t.Fatalf("unsigned gap should not receive a cached signature: %s", unsignedX[0].Get("signature").String())
+	}
+	if b[0].Get("signature").String() != "sig2" {
+		t.Fatalf("second retained turn should keep sig2, got %s", b[0].Get("signature").String())
+	}
+}
+
+func TestClaudeThinkingReplayFindStartIndex_RefusesAmbiguousShorterSuffix(t *testing.T) {
+	assistant := []gjson.Result{
+		gjson.Parse(`[{"type":"text","text":"A"}]`),
+		gjson.Parse(`[{"type":"text","text":"X"}]`),
+	}
+	cached := [][]byte{
+		[]byte(`[{"type":"text","text":"A"}]`),
+		[]byte(`[{"type":"text","text":"A"}]`),
+	}
+	if got, _ := helps.ClaudeThinkingReplayFindStartIndex(assistant, cached); got != -1 {
+		t.Fatalf("expected -1 for ambiguous shorter suffix with duplicate cached visible turn, got %d", got)
+	}
+
+	// A leading unsigned duplicate with the same visible content as a later
+	// retained cached turn must not steal that cached signature. Request
+	// [B-unsigned, B-retained] and cached [A, B] (different visible) gives a
+	// length-1 match only at the latest offset, which should restore only the
+	// retained second turn.
+	body := []byte(`{"messages":[{"role":"user","content":"u"},{"role":"assistant","content":[{"type":"text","text":"B"}]},{"role":"assistant","content":[{"type":"thinking","thinking":"r"},{"type":"text","text":"B"}]},{"role":"user","content":"u2"}]}`)
+	retained := [][]byte{
+		[]byte(`[{"type":"thinking","thinking":"r","signature":"sig1"},{"type":"text","text":"A"}]`),
+		[]byte(`[{"type":"thinking","thinking":"r","signature":"sig2"},{"type":"text","text":"B"}]`),
+	}
+	updated, restored := helps.RestoreClaudeThinkingReplayContents(body, retained)
+	if !restored {
+		t.Fatal("expected restore for retained suffix")
+	}
+	first := gjson.GetBytes(updated, "messages.1.content").Array()
+	second := gjson.GetBytes(updated, "messages.2.content").Array()
+	if first[0].Get("signature").String() != "" {
+		t.Fatalf("first unsigned turn should not receive cached signature: %s", first[0].Get("signature").String())
+	}
+	if second[0].Get("signature").String() != "sig2" {
+		t.Fatalf("second retained turn should receive latest cached signature, got %s", second[0].Get("signature").String())
+	}
+}
+
+func TestRestoreClaudeThinkingReplayContents_RejectDuplicateRequestSideAnchors(t *testing.T) {
+	// A cached signed turn followed by an uncached unsigned duplicate with the
+	// same visible content must not have its signature injected into the later
+	// unsigned turn. The earlier retained turn should keep its signature.
+	body := []byte(`{"messages":[{"role":"user","content":"u"},{"role":"assistant","content":[{"type":"thinking","thinking":"r","signature":"sig"},{"type":"text","text":"A"}]},{"role":"assistant","content":[{"type":"text","text":"A"}]},{"role":"user","content":"u2"}]}`)
+	cached := [][]byte{
+		[]byte(`[{"type":"thinking","thinking":"r","signature":"sig"},{"type":"text","text":"A"}]`),
+	}
+
+	updated, _ := helps.RestoreClaudeThinkingReplayContents(body, cached)
+	first := gjson.GetBytes(updated, "messages.1.content").Array()
+	second := gjson.GetBytes(updated, "messages.2.content").Array()
+	if first[0].Get("signature").String() != "sig" {
+		t.Fatalf("first retained turn should keep cached signature, got %s", first[0].Get("signature").String())
+	}
+	if second[0].Get("signature").String() != "" {
+		t.Fatalf("later unsigned duplicate should not receive cached signature, got %s", second[0].Get("signature").String())
+	}
+}
+
+func TestRestoreClaudeThinkingReplayContents_RejectDuplicateAnchorsInMultiTurnSuffix(t *testing.T) {
+	// A cached [A, B] with duplicate visible A in the request (both unsigned)
+	// must not restore A's signature onto the later unsigned A. The match for
+	// the ambiguous A should fail and the algorithm should fall back to a
+	// length-1 suffix restoring only B.
+	body := []byte(`{"messages":[{"role":"user","content":"u1"},{"role":"assistant","content":[{"type":"text","text":"A"}]},{"role":"user","content":"u2"},{"role":"assistant","content":[{"type":"text","text":"A"}]},{"role":"user","content":"u3"},{"role":"assistant","content":[{"type":"text","text":"B"}]},{"role":"user","content":"u4"}]}`)
+	cached := [][]byte{
+		[]byte(`[{"type":"thinking","thinking":"a","signature":"sig-a"},{"type":"text","text":"A"}]`),
+		[]byte(`[{"type":"thinking","thinking":"b","signature":"sig-b"},{"type":"text","text":"B"}]`),
+	}
+
+	updated, restored := helps.RestoreClaudeThinkingReplayContents(body, cached)
+	if !restored {
+		t.Fatal("expected restore for unambiguous B suffix")
+	}
+
+	first := gjson.GetBytes(updated, "messages.1.content").Array()
+	duplicate := gjson.GetBytes(updated, "messages.3.content").Array()
+	last := gjson.GetBytes(updated, "messages.5.content").Array()
+
+	if first[0].Get("signature").String() != "" {
+		t.Fatalf("first A should remain unsigned: %s", first[0].Get("signature").String())
+	}
+	if duplicate[0].Get("signature").String() != "" {
+		t.Fatalf("duplicate A should not receive cached A signature: %s", duplicate[0].Get("signature").String())
+	}
+	if last[0].Get("signature").String() != "sig-b" {
+		t.Fatalf("B should be restored from latest cached suffix, got %s", last[0].Get("signature").String())
+	}
+}
+
+func TestClaudeThinkingReplayAssistantMessageHash_NormalizesStringShorthand(t *testing.T) {
+	modelFamily := "claude:test"
+	callerHash := "caller"
+	strHash := helps.ClaudeThinkingReplayAssistantMessageHash(modelFamily, callerHash, []byte(`"answer"`))
+	arrHash := helps.ClaudeThinkingReplayAssistantMessageHash(modelFamily, callerHash, []byte(`[{"type":"text","text":"answer"}]`))
+	if strHash == "" || arrHash == "" {
+		t.Fatalf("string shorthand or array form produced empty hash")
+	}
+	if strHash != arrHash {
+		t.Fatalf("string shorthand %q must match array form %q", strHash, arrHash)
 	}
 }
 
@@ -79,14 +221,14 @@ func TestClaudeThinkingReplayCallerHash_IgnoresWhitespaceOnlyHeaders(t *testing.
 	payload := []byte(`{"messages":[{"role":"user","content":"hello"}]}`)
 	req := cliproxyexecutor.Request{Payload: payload}
 
-	withWhitespace := claudeThinkingReplayCallerHash(auth, req, cliproxyexecutor.Options{
+	withWhitespace := helps.ClaudeThinkingReplayCallerHash(auth, req, cliproxyexecutor.Options{
 		Headers: http.Header{
 			"User-Agent":        []string{"client/1.0"},
 			"X-App":             []string{"   "},
 			"X-Codex-Client-Id": []string{"\t\n"},
 		},
 	})
-	withoutWhitespace := claudeThinkingReplayCallerHash(auth, req, cliproxyexecutor.Options{
+	withoutWhitespace := helps.ClaudeThinkingReplayCallerHash(auth, req, cliproxyexecutor.Options{
 		Headers: http.Header{
 			"User-Agent": []string{"client/1.0"},
 		},
@@ -1240,7 +1382,7 @@ func TestRestoreClaudeThinkingReplayContents_MatchesDuplicateTurnsInChronologica
 		[]byte(`[{"type":"thinking","thinking":"second","signature":"sig-2"},{"type":"text","text":"same"}]`),
 	}
 
-	updated, restored := restoreClaudeThinkingReplayContents(body, cached)
+	updated, restored := helps.RestoreClaudeThinkingReplayContents(body, cached)
 	if !restored {
 		t.Fatal("expected restore")
 	}
@@ -1334,7 +1476,7 @@ func TestRestoreClaudeThinkingReplayContents_AlignsAfterTruncatedHistory(t *test
 		[]byte(`[{"type":"thinking","thinking":"third","signature":"sig-3"},{"type":"text","text":"third"}]`),
 	}
 
-	updated, restored := restoreClaudeThinkingReplayContents(body, cached)
+	updated, restored := helps.RestoreClaudeThinkingReplayContents(body, cached)
 	if !restored {
 		t.Fatal("expected restore")
 	}
@@ -1366,7 +1508,7 @@ func TestRestoreClaudeThinkingReplayContents_SkipsUnsignedLeadingAssistant(t *te
 		[]byte(`[{"type":"thinking","thinking":"second","signature":"sig-2"},{"type":"text","text":"second"}]`),
 	}
 
-	updated, restored := restoreClaudeThinkingReplayContents(body, cached)
+	updated, restored := helps.RestoreClaudeThinkingReplayContents(body, cached)
 	if !restored {
 		t.Fatal("expected restore")
 	}
@@ -1397,7 +1539,7 @@ func TestRestoreClaudeThinkingReplayContents_AnchorsDuplicateSuffixAfterTruncati
 		[]byte(`[{"type":"thinking","thinking":"other","signature":"sig-other"},{"type":"text","text":"different"}]`),
 	}
 
-	updated, restored := restoreClaudeThinkingReplayContents(body, cached)
+	updated, restored := helps.RestoreClaudeThinkingReplayContents(body, cached)
 	if !restored {
 		t.Fatal("expected restore")
 	}
@@ -1424,7 +1566,7 @@ func TestRestoreClaudeThinkingReplayContents_NormalizesStringShorthand(t *testin
 		[]byte(`[{"type":"thinking","thinking":"reasoning","signature":"sig"},{"type":"text","text":"answer"}]`),
 	}
 
-	updated, restored := restoreClaudeThinkingReplayContents(body, cached)
+	updated, restored := helps.RestoreClaudeThinkingReplayContents(body, cached)
 	if !restored {
 		t.Fatal("expected restore for string shorthand assistant content")
 	}
