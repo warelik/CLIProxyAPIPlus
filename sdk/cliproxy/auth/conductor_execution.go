@@ -469,6 +469,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				if ra := retryAfterFromError(errExec); ra != nil {
 					result.RetryAfter = ra
 				}
+				result.TransientRateLimit = isTransientRateLimitError(errExec)
 				if isCredentialScopedError(errExec) {
 					result.CredentialScope = true
 				}
@@ -675,6 +676,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				if ra := retryAfterFromError(errExec); ra != nil {
 					result.RetryAfter = ra
 				}
+				result.TransientRateLimit = isTransientRateLimitError(errExec)
 				action, okAction := matchRequestScopedErrorAction(auth, errExec, m.runtimeConfigSnapshot())
 				applyRequestScopedActionToResult(action, okAction, &result)
 				// Some Anthropic-compatible upstreams do not implement the
@@ -1089,7 +1091,7 @@ func shouldExcludeHomeAuthAfterStreamError(ctx context.Context, auth *Auth, err 
 	if cliproxyexecutor.DownstreamWebsocket(ctx) && statusCodeFromError(err) == http.StatusUpgradeRequired {
 		return false
 	}
-	return !isUnauthorizedError(err) || auth == nil || auth.AuthKind() != AuthKindOAuth
+	return !isUnauthorizedError(err)
 }
 
 func extractExcludedAuthIDs(meta map[string]any) map[string]struct{} {

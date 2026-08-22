@@ -767,16 +767,13 @@ func retryRoundAvailabilityForAuth(auth *Auth, model string, now time.Time) (boo
 				continue
 			}
 			matchedBlocked = true
-			if stateNext.IsZero() || !credentialRetryRoundStateEligible(state.LastError, state.Quota.Exceeded) {
+			if stateNext.IsZero() {
 				return false, time.Time{}
 			}
 		}
 		if matchedBlocked {
 			return true, next
 		}
-	}
-	if !credentialRetryRoundStateEligible(auth.LastError, auth.Quota.Exceeded) {
-		return false, time.Time{}
 	}
 	return true, next
 }
@@ -804,7 +801,6 @@ func (m *Manager) closestCooldownWait(providers []string, model string, attempt 
 		}
 		providerSet[key] = struct{}{}
 	}
-	registryRef := registry.GetGlobalRegistry()
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	var (
@@ -823,9 +819,6 @@ func (m *Manager) closestCooldownWait(providers []string, model string, attempt 
 		}
 		providerKey := executorKeyFromAuth(auth)
 		if _, ok := providerSet[providerKey]; !ok {
-			continue
-		}
-		if model != "" && !m.authSupportsRouteModel(registryRef, auth, model) {
 			continue
 		}
 		if _, ok := excluded[auth.ID]; ok {
@@ -878,7 +871,6 @@ func (m *Manager) retryAllowed(attempt int, providers []string, model string, el
 		return false
 	}
 
-	registryRef := registry.GetGlobalRegistry()
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for _, auth := range m.auths {
@@ -893,9 +885,6 @@ func (m *Manager) retryAllowed(attempt int, providers []string, model string, el
 		}
 		providerKey := executorKeyFromAuth(auth)
 		if _, ok := providerSet[providerKey]; !ok {
-			continue
-		}
-		if model != "" && !m.authSupportsRouteModel(registryRef, auth, model) {
 			continue
 		}
 		if _, ok := excluded[auth.ID]; ok {

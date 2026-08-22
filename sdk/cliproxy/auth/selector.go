@@ -725,13 +725,19 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		}
 		s.cache.Set(cacheKey, authID)
 	}
+	bindIfAbsent := func(authID string) (string, bool) {
+		if fallbackKey != "" {
+			return s.cache.SetAliasGroupIfAbsent(authID, cacheKey, fallbackKey)
+		}
+		return s.cache.SetAliasGroupIfAbsent(authID, cacheKey)
+	}
 
 	collectTempFallbackKeys := func() []string {
 		keys := []string{cacheKey}
 		if fallbackKey != "" {
 			keys = append(keys, fallbackKey)
 		}
-		if _, _, aliases, ok := s.cache.Observe(cacheKey); ok {
+		if aliases := s.cache.Aliases(cacheKey); len(aliases) > 0 {
 			for _, alias := range aliases {
 				if alias != "" {
 					keys = append(keys, alias)
@@ -739,7 +745,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			}
 		}
 		if fallbackKey != "" {
-			if _, _, aliases, ok := s.cache.Observe(fallbackKey); ok {
+			if aliases := s.cache.Aliases(fallbackKey); len(aliases) > 0 {
 				for _, alias := range aliases {
 					if alias != "" {
 						keys = append(keys, alias)
@@ -831,50 +837,32 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		return nil, err
 	}
 
-	coldKeys := []string{cacheKey}
-	if fallbackKey != "" {
-		coldKeys = append(coldKeys, fallbackKey)
-	}
-	// Cold cache binding: atomically install the binding only when no alias is
-	// already bound to a different auth. Free aliases are attached to the same
-	// auth, so a later turn that retains only the conversation ID stays sticky.
-	boundAuth, ok := s.cache.SetAliasesIfNoConflict(auth.ID, coldKeys...)
-	if ok {
-		entry.Infof("session-affinity: cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+	// Avoid concurrent cache-miss picks from binding different auths.
+	// Only the first goroutine to set the alias group wins; the rest
+	// re-observe the binding and return the same auth.
+	if boundAuthID, ok := bindIfAbsent(auth.ID); !ok {
+		if boundAuthID != "" {
+			for _, a := range available {
+				if a.ID == boundAuthID {
+					auth = a
+					break
+				}
+			}
+		}
+		if auth.ID != boundAuthID && boundAuthID != "" {
+			// The actually-bound auth is no longer available. Keep our
+			// fallback pick and bind it explicitly.
+			bind(auth.ID)
+			entry.Infof("session-affinity: cache miss, concurrent binding unavailable, rebinding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+			return auth, nil
+		}
+		bind(auth.ID)
+		entry.Infof("session-affinity: cache miss, concurrent binding resolved | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 		return auth, nil
 	}
-	if boundAuth != "" {
-		for _, a := range available {
-			if a.ID == boundAuth {
-				entry.Infof("session-affinity: cache miss, alias already bound to %s | session=%s provider=%s model=%s", a.ID, truncateSessionID(primaryID), provider, model)
-				return a, nil
-			}
-		}
-		// The conflicting auth is no longer available. Rebind the full alias
-		// group to the winning auth only if the group is still bound to the
-		// unavailable auth, so a concurrent caller that already rebound it is not
-		// overwritten by the loser.
-		if rebound := s.rebindConflictingAliases(boundAuth, auth.ID, coldKeys); rebound {
-			entry.Infof("session-affinity: cache miss, conflicting auth unavailable, rebinding group | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
-		} else if currentAuth, ok := s.cache.GetAndRefresh(cacheKey); ok {
-			for _, a := range available {
-				if a.ID == currentAuth {
-					entry.Infof("session-affinity: cache miss, alias rebound concurrently to %s | session=%s provider=%s model=%s", a.ID, truncateSessionID(primaryID), provider, model)
-					return a, nil
-				}
-			}
-			if fallbackKey != "" {
-				if currentAuth, ok := s.cache.Get(fallbackKey); ok {
-					for _, a := range available {
-						if a.ID == currentAuth {
-							entry.Infof("session-affinity: cache miss, alias rebound concurrently to %s | session=%s provider=%s model=%s", a.ID, truncateSessionID(primaryID), provider, model)
-							return a, nil
-						}
-					}
-				}
-			}
-		}
-	}
+
+	bind(auth.ID)
+	entry.Infof("session-affinity: cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 	return auth, nil
 }
 
@@ -894,15 +882,6 @@ func (s *SessionAffinitySelector) rebindAliasGroupCAS(sessionKey string, expecte
 		expectedAuthID, expectedGen, expectedAliases = authID, gen, aliases
 	}
 	return false
-}
-
-// rebindConflictingAliases attempts to rebind the alias group currently bound
-// to expectedAuthID to newAuthID, merging any cold keys and any other alias
-// groups bound to the same auth. If a concurrent caller already rebound the
-// group away from expectedAuthID, the cache is left untouched.
-func (s *SessionAffinitySelector) rebindConflictingAliases(expectedAuthID, newAuthID string, coldKeys []string) bool {
-	_, ok := s.cache.ReplaceAliasesIfUnchanged(expectedAuthID, newAuthID, coldKeys...)
-	return ok
 }
 
 // mergeSplitAliasGroupsCAS reconciles two split session alias groups (a
@@ -951,6 +930,15 @@ func (s *SessionAffinitySelector) mergeSplitAliasGroupsCAS(cacheKey, fallbackKey
 		s.cache.RestoreAliasesIfAbsent(deletedAuthF, retainedF...)
 	}
 	return false
+}
+
+// rebindConflictingAliases attempts to rebind the alias group currently bound
+// to expectedAuthID to newAuthID, merging any cold keys and any other alias
+// groups bound to the same auth. If a concurrent caller already rebound the
+// group away from expectedAuthID, the cache is left untouched.
+func (s *SessionAffinitySelector) rebindConflictingAliases(expectedAuthID, newAuthID string, coldKeys []string) bool {
+	_, ok := s.cache.ReplaceAliasesIfUnchanged(expectedAuthID, newAuthID, coldKeys...)
+	return ok
 }
 
 func (s *SessionAffinitySelector) excludeSessionQuarantine(cacheKey, fallbackKey string, auths []*Auth) []*Auth {
@@ -1033,7 +1021,7 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
 		if fallbackKey != "" {
 			keys = append(keys, fallbackKey)
 		}
-		if _, _, aliases, ok := s.cache.Observe(cacheKey); ok {
+		if aliases := s.cache.Aliases(cacheKey); len(aliases) > 0 {
 			for _, alias := range aliases {
 				if alias != "" {
 					keys = append(keys, alias)
@@ -1041,7 +1029,7 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
 			}
 		}
 		if fallbackKey != "" {
-			if _, _, aliases, ok := s.cache.Observe(fallbackKey); ok {
+			if aliases := s.cache.Aliases(fallbackKey); len(aliases) > 0 {
 				for _, alias := range aliases {
 					if alias != "" {
 						keys = append(keys, alias)
@@ -1079,6 +1067,7 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
 	}
 
 	if res.Error != nil && isTerminalSessionAffinityError(res.Error) {
+		tempKeys := collectResultTempFallbackKeys()
 		var aliases []string
 		if s.cache != nil {
 			aliases = s.cache.CompareAndDeleteAliases(cacheKey, res.AuthID)
@@ -1090,7 +1079,7 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
 			aliases = []string{cacheKey, fallbackKey}
 		}
 		if s.fallbackCache != nil {
-			for _, tk := range collectResultTempFallbackKeys() {
+			for _, tk := range tempKeys {
 				s.fallbackCache.CompareAndDelete(tk, res.AuthID)
 			}
 		}
