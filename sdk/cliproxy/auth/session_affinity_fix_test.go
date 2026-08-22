@@ -1,5 +1,3 @@
-//go:build ignore
-
 package auth
 
 import (
@@ -414,7 +412,7 @@ func TestSessionAffinity_StreamSuccessThroughWrapperBinds(t *testing.T) {
 	cacheKey := "stream-provider::header:stream-sess-12345::stream-model"
 
 	chunk := cliproxyexecutor.StreamChunk{Payload: []byte("data: {\"id\":\"x\"}\n\n")}
-	res := manager.wrapStreamResult(ctx, auth, "stream-provider", "stream-model", opts, nil, []cliproxyexecutor.StreamChunk{chunk}, closedStreamChunks(), OAuthModelAliasResult{}, false)
+	res := manager.wrapStreamResult(ctx, auth, "stream-provider", "stream-model", nil, []cliproxyexecutor.StreamChunk{chunk}, closedStreamChunks(), OAuthModelAliasResult{}, false, opts)
 	for range res.Chunks {
 	}
 
@@ -447,7 +445,7 @@ func TestSessionAffinity_StreamFailureThroughWrapperInvalidates(t *testing.T) {
 
 	// Stream fails with a transient upstream error (503). The binding must be retained.
 	errChunk := cliproxyexecutor.StreamChunk{Err: &Error{HTTPStatus: http.StatusServiceUnavailable}}
-	res := manager.wrapStreamResult(ctx, auth, "stream-provider", "stream-model", opts, nil, []cliproxyexecutor.StreamChunk{errChunk}, closedStreamChunks(), OAuthModelAliasResult{}, false)
+	res := manager.wrapStreamResult(ctx, auth, "stream-provider", "stream-model", nil, []cliproxyexecutor.StreamChunk{errChunk}, closedStreamChunks(), OAuthModelAliasResult{}, false, opts)
 	for range res.Chunks {
 	}
 
@@ -585,7 +583,7 @@ func TestSessionAffinity_MixedNamespace_StreamBindsAndRetainsCanonicalKey(t *tes
 
 	// Success binds under the canonical key.
 	chunk := cliproxyexecutor.StreamChunk{Payload: []byte("data: {\"id\":\"x\"}\n\n")}
-	res := manager.wrapStreamResult(ctx, auth, "gemini", "stream-model", opts, nil, []cliproxyexecutor.StreamChunk{chunk}, closedStreamChunks(), OAuthModelAliasResult{}, false)
+	res := manager.wrapStreamResult(ctx, auth, "gemini", "stream-model", nil, []cliproxyexecutor.StreamChunk{chunk}, closedStreamChunks(), OAuthModelAliasResult{}, false, opts)
 	for range res.Chunks {
 	}
 	bound, ok := affinity.cache.Get(cacheKey)
@@ -595,7 +593,7 @@ func TestSessionAffinity_MixedNamespace_StreamBindsAndRetainsCanonicalKey(t *tes
 
 	// A 503 stream failure is transient: the canonical binding must be retained.
 	errChunk := cliproxyexecutor.StreamChunk{Err: &Error{HTTPStatus: http.StatusServiceUnavailable}}
-	res2 := manager.wrapStreamResult(ctx, auth, "gemini", "stream-model", opts, nil, []cliproxyexecutor.StreamChunk{errChunk}, closedStreamChunks(), OAuthModelAliasResult{}, false)
+	res2 := manager.wrapStreamResult(ctx, auth, "gemini", "stream-model", nil, []cliproxyexecutor.StreamChunk{errChunk}, closedStreamChunks(), OAuthModelAliasResult{}, false, opts)
 	for range res2.Chunks {
 	}
 	if bound, ok := affinity.cache.Get(cacheKey); !ok || bound != auth.ID {
@@ -790,7 +788,7 @@ func TestSessionAffinity_ModelNamespace_StreamRewriteBindsAndRetainsRouteKey(t *
 
 	// Stream succeeds with a rewritten upstream model; must bind the route-model key.
 	chunk := cliproxyexecutor.StreamChunk{Payload: []byte("data: {\"id\":\"x\"}\n\n")}
-	res := manager.wrapStreamResult(ctx, auth, "gemini", "gemini-3.5-flash-lite", opts, nil, []cliproxyexecutor.StreamChunk{chunk}, closedStreamChunks(), OAuthModelAliasResult{}, false)
+	res := manager.wrapStreamResult(ctx, auth, "gemini", "gemini-3.5-flash-lite", nil, []cliproxyexecutor.StreamChunk{chunk}, closedStreamChunks(), OAuthModelAliasResult{}, false, opts)
 	for range res.Chunks {
 	}
 	bound, ok := affinity.cache.Get(routeKey)
@@ -800,7 +798,7 @@ func TestSessionAffinity_ModelNamespace_StreamRewriteBindsAndRetainsRouteKey(t *
 
 	// A 503 stream failure is transient: the route key binding must be retained.
 	errChunk := cliproxyexecutor.StreamChunk{Err: &Error{HTTPStatus: http.StatusServiceUnavailable}}
-	res2 := manager.wrapStreamResult(ctx, auth, "gemini", "gemini-3.5-flash-lite", opts, nil, []cliproxyexecutor.StreamChunk{errChunk}, closedStreamChunks(), OAuthModelAliasResult{}, false)
+	res2 := manager.wrapStreamResult(ctx, auth, "gemini", "gemini-3.5-flash-lite", nil, []cliproxyexecutor.StreamChunk{errChunk}, closedStreamChunks(), OAuthModelAliasResult{}, false, opts)
 	for range res2.Chunks {
 	}
 	if bound, ok := affinity.cache.Get(routeKey); !ok || bound != auth.ID {
