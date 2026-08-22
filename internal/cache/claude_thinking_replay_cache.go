@@ -153,16 +153,10 @@ func GetClaudeThinkingReplayRequired(ctx context.Context, modelFamily, sessionKe
 	return contents, found, errGet
 }
 
-// GetClaudeThinkingReplayWithSnapshotRequired retrieves replay content and the exact cache state read.
-// It does not reserve new state for an absent session, so read-only requests cannot
-// create unbounded Home KV tombstones.
-func GetClaudeThinkingReplayWithSnapshotRequired(ctx context.Context, modelFamily, sessionKey string) ([][]byte, ClaudeThinkingReplaySnapshot, bool, error) {
-	return getClaudeThinkingReplayWithSnapshot(ctx, modelFamily, sessionKey, false)
-}
-
-// getClaudeThinkingReplayWithSnapshot reads (and optionally reserves) replay content
-// and the exact cache state.
-func getClaudeThinkingReplayWithSnapshot(ctx context.Context, modelFamily, sessionKey string, reserve bool) ([][]byte, ClaudeThinkingReplaySnapshot, bool, error) {
+// GetClaudeThinkingReplayWithSnapshotIfExists reads replay state without reserving a tombstone.
+// Use this for no-nonce fallback scopes so Home KV is only populated when a replayable
+// response is actually cached.
+func GetClaudeThinkingReplayWithSnapshotIfExists(ctx context.Context, modelFamily, sessionKey string) ([][]byte, ClaudeThinkingReplaySnapshot, bool, error) {
 	key := claudeThinkingReplayCacheKey(modelFamily, sessionKey)
 	if key == "" {
 		return nil, ClaudeThinkingReplaySnapshot{}, false, nil
@@ -173,7 +167,7 @@ func getClaudeThinkingReplayWithSnapshot(ctx context.Context, modelFamily, sessi
 	client, homeMode, errClient := currentClaudeThinkingReplayKVClient()
 	if homeMode {
 		if errClient != nil {
-			return nil, ClaudeThinkingReplaySnapshot{loaded: true}, false, errClient
+			return nil, ClaudeThinkingReplaySnapshot{}, false, errClient
 		}
 		kvKey := claudeThinkingReplayKVKey(modelFamily, sessionKey)
 		raw, found, errRead := client.KVGet(ctx, kvKey)
@@ -181,17 +175,9 @@ func getClaudeThinkingReplayWithSnapshot(ctx context.Context, modelFamily, sessi
 			return nil, ClaudeThinkingReplaySnapshot{}, false, errRead
 		}
 		if !found {
-			if !reserve {
-				return nil, ClaudeThinkingReplaySnapshot{}, false, nil
-			}
-			var errReserve error
-			raw, errReserve = readOrReserveClaudeThinkingReplayHomeValue(ctx, client, kvKey)
-			if errReserve != nil {
-				return nil, ClaudeThinkingReplaySnapshot{loaded: true}, false, errReserve
-			}
-			found = true
+			return nil, ClaudeThinkingReplaySnapshot{loaded: false, found: false}, false, nil
 		}
-		snapshot := ClaudeThinkingReplaySnapshot{raw: append([]byte(nil), raw...), loaded: true, found: found}
+		snapshot := ClaudeThinkingReplaySnapshot{raw: append([]byte(nil), raw...), loaded: true, found: true}
 		contents, generation, deleted, okDecode := decodeClaudeThinkingReplayHomeValue(raw)
 		if !okDecode {
 			return nil, snapshot, false, fmt.Errorf("invalid Claude thinking replay content")
@@ -216,8 +202,60 @@ func getClaudeThinkingReplayWithSnapshot(ctx context.Context, modelFamily, sessi
 			claudeThinkingReplayTotalBytes -= claudeThinkingReplayEntryBytes(entry.Contents)
 			delete(claudeThinkingReplayEntries, key)
 		}
-		if !reserve {
-			return nil, ClaudeThinkingReplaySnapshot{}, false, nil
+		return nil, ClaudeThinkingReplaySnapshot{loaded: false, found: false}, false, nil
+	}
+	entry.Timestamp = now
+	claudeThinkingReplayEntries[key] = entry
+	snapshot := ClaudeThinkingReplaySnapshot{generation: entry.Generation, loaded: true, found: true}
+	if entry.Deleted {
+		return nil, snapshot, false, nil
+	}
+	return cloneClaudeThinkingReplayContents(entry.Contents), snapshot, len(entry.Contents) > 0, nil
+}
+
+// GetClaudeThinkingReplayWithSnapshotRequired retrieves replay content and the exact cache state read.
+func GetClaudeThinkingReplayWithSnapshotRequired(ctx context.Context, modelFamily, sessionKey string) ([][]byte, ClaudeThinkingReplaySnapshot, bool, error) {
+	key := claudeThinkingReplayCacheKey(modelFamily, sessionKey)
+	if key == "" {
+		return nil, ClaudeThinkingReplaySnapshot{}, false, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	client, homeMode, errClient := currentClaudeThinkingReplayKVClient()
+	if homeMode {
+		if errClient != nil {
+			return nil, ClaudeThinkingReplaySnapshot{loaded: true}, false, errClient
+		}
+		kvKey := claudeThinkingReplayKVKey(modelFamily, sessionKey)
+		raw, errRead := readOrReserveClaudeThinkingReplayHomeValue(ctx, client, kvKey)
+		if errRead != nil {
+			return nil, ClaudeThinkingReplaySnapshot{loaded: true}, false, errRead
+		}
+		snapshot := ClaudeThinkingReplaySnapshot{raw: append([]byte(nil), raw...), loaded: true, found: true}
+		contents, generation, deleted, okDecode := decodeClaudeThinkingReplayHomeValue(raw)
+		if !okDecode {
+			return nil, snapshot, false, fmt.Errorf("invalid Claude thinking replay content")
+		}
+		snapshot.generation = generation
+		if _, errExpire := client.KVExpire(ctx, kvKey, ClaudeThinkingReplayCacheTTL); errExpire != nil {
+			log.Warnf("home kv Claude thinking replay expire failed: %v", errExpire)
+		}
+		if deleted {
+			return nil, snapshot, false, nil
+		}
+		return cloneClaudeThinkingReplayContents(contents), snapshot, len(contents) > 0, nil
+	}
+
+	cacheCleanupOnce.Do(startCacheCleanup)
+	now := time.Now()
+	claudeThinkingReplayMu.Lock()
+	defer claudeThinkingReplayMu.Unlock()
+	entry, ok := claudeThinkingReplayEntries[key]
+	if !ok || now.Sub(entry.Timestamp) > ClaudeThinkingReplayCacheTTL {
+		if ok {
+			claudeThinkingReplayTotalBytes -= claudeThinkingReplayEntryBytes(entry.Contents)
+			delete(claudeThinkingReplayEntries, key)
 		}
 		entry = reserveClaudeThinkingReplayLocalLocked(key, now)
 	}
@@ -240,14 +278,7 @@ func ReplaceClaudeThinkingReplayIfUnchanged(ctx context.Context, modelFamily, se
 		ctx = context.Background()
 	}
 	if !snapshot.loaded {
-		var errGet error
-		_, snapshot, _, errGet = getClaudeThinkingReplayWithSnapshot(ctx, modelFamily, sessionKey, true)
-		if errGet != nil {
-			return false, errGet
-		}
-		if !snapshot.loaded {
-			return CacheClaudeThinkingReplayBestEffort(ctx, modelFamily, sessionKey, content), nil
-		}
+		return CacheClaudeThinkingReplayBestEffort(ctx, modelFamily, sessionKey, content), nil
 	}
 	client, homeMode, errClient := currentClaudeThinkingReplayKVClient()
 	if homeMode {
