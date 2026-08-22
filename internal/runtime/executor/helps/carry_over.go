@@ -19,8 +19,10 @@ const (
 
 // CarryOverThinkingToSystem extracts reasoning_content from assistant messages
 // in an OpenAI Chat Completions payload and rewrites it as a labeled system
-// instruction. It drops assistant messages that become empty after the move.
-// Existing first system message is extended; otherwise a new one is inserted.
+// instruction. It drops assistant messages that are empty after reasoning is
+// removed, including assistant messages that were already empty. OpenAI rejects
+// empty assistant messages, so removing them is intentional. Existing first
+// system message is extended; otherwise a new one is inserted.
 //
 // The function does not add reasoning to response bodies; it is only for
 // request bodies being sent to a target without a canonical thought field.
@@ -137,6 +139,12 @@ func formatCarryOverText(blocks []string) string {
 	return strings.Join(parts, "\n")
 }
 
+func newCarryOverTextPart(text string) []byte {
+	part := []byte(`{"type":"text","text":""}`)
+	part, _ = sjson.SetBytes(part, "text", text)
+	return part
+}
+
 func mergeCarryOverIntoSystemMessage(msg []byte, carryOverText string) []byte {
 	c := gjson.GetBytes(msg, "content")
 
@@ -149,13 +157,13 @@ func mergeCarryOverIntoSystemMessage(msg []byte, carryOverText string) []byte {
 		msg, _ = sjson.SetBytes(msg, "content", merged)
 
 	case c.IsArray():
-		newPart := []byte(`{"type":"text","text":""}`)
-		newPart, _ = sjson.SetBytes(newPart, "text", carryOverText)
-
-		items := [][]byte{newPart}
+		items := [][]byte{newCarryOverTextPart(carryOverText)}
 		c.ForEach(func(_, part gjson.Result) bool {
-			if part.IsObject() {
+			switch {
+			case part.IsObject():
 				items = append(items, []byte(part.Raw))
+			case part.Type == gjson.String:
+				items = append(items, newCarryOverTextPart(part.String()))
 			}
 			return true
 		})
@@ -172,8 +180,9 @@ func mergeCarryOverIntoSystemMessage(msg []byte, carryOverText string) []byte {
 // carryOverClaudeSource extracts unsigned assistant thinking blocks from a
 // Claude request and rewrites them as a top-level system instruction. Signed
 // thinking with a compatible signature is left in place so the normal registry
-// path can map it to reasoning_content. This runs before registry translation
-// so plugin NormalizeRequest hooks still see the translated OpenAI-shaped payload.
+// path can map it to reasoning_content. This runs before native translation so
+// unsigned thinking is not dropped; plugin NormalizeRequest hooks then run on
+// the translated provider payload and own the final OpenAI-shaped request.
 func carryOverClaudeSource(payload []byte) []byte {
 	if len(payload) == 0 || !gjson.ValidBytes(payload) {
 		return payload
@@ -242,11 +251,7 @@ func carryOverClaudeSource(payload []byte) []byte {
 		}
 
 		updated := []byte(msg.Raw)
-		if len(keptParts) == 0 {
-			updated, _ = sjson.SetRawBytes(updated, "content", []byte("[]"))
-		} else {
-			updated, _ = sjson.SetRawBytes(updated, "content", translatorcommon.JoinRawArray(keptParts))
-		}
+		updated, _ = sjson.SetRawBytes(updated, "content", translatorcommon.JoinRawArray(keptParts))
 		keptMessages = append(keptMessages, updated)
 		return true
 	})
@@ -286,13 +291,13 @@ func injectClaudeCarryOverSystem(payload []byte, carryOverText string) []byte {
 		payload, _ = sjson.SetBytes(payload, "system", merged)
 
 	case system.IsArray():
-		newPart := []byte(`{"type":"text","text":""}`)
-		newPart, _ = sjson.SetBytes(newPart, "text", carryOverText)
-
-		items := [][]byte{newPart}
+		items := [][]byte{newCarryOverTextPart(carryOverText)}
 		system.ForEach(func(_, part gjson.Result) bool {
-			if part.IsObject() {
+			switch {
+			case part.IsObject():
 				items = append(items, []byte(part.Raw))
+			case part.Type == gjson.String:
+				items = append(items, newCarryOverTextPart(part.String()))
 			}
 			return true
 		})
