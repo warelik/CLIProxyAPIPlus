@@ -177,6 +177,11 @@ type Options struct {
 	RequestAfterAuthInterceptor RequestAfterAuthInterceptor
 	// ExecutionLifecycle owns Home-dispatched execution resources. Executors must not add it to request metadata.
 	ExecutionLifecycle ExecutionLifecycle
+
+	// OnStreamConnected is called by streaming executors once the upstream
+	// connection has been established, allowing the caller to stop connection-
+	// scoped timers before the first response headers or chunk arrives.
+	OnStreamConnected func()
 }
 
 // EnsureMetadata initializes and returns Metadata, ensuring it is non-nil.
