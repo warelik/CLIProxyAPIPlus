@@ -775,12 +775,91 @@ func TestClaudeThinkingReplayAliasHomeRollBackRestoresPreviousValue(t *testing.T
 
 	client := newFakeClaudeThinkingReplayKVClient()
 	client.values[aliasKey] = append([]byte(nil), committedRaw...)
+	// A stale index record proves a prior registration of this key was durable.
+	index, _ := json.Marshal(claudeThinkingReplayAliasIndex{Aliases: []claudeThinkingReplayAliasIndexRecord{{
+		AliasKey:  aliasKey,
+		Timestamp: now.Add(-time.Minute),
+	}}})
+	client.values[indexKey] = index
 	useFakeClaudeThinkingReplayKVClient(t, client, true)
 
 	rollBackClaudeThinkingReplayAliasHome(ctx, client, aliasKey, indexKey, committedRaw, previousRaw, now)
 
 	if string(client.values[aliasKey]) != string(previousRaw) {
 		t.Fatalf("rollback did not restore previous alias value: got %s, want %s", client.values[aliasKey], previousRaw)
+	}
+	if ttl, ok := client.swapsTTLs[aliasKey]; !ok || ttl != ClaudeThinkingReplayCacheTTL {
+		t.Fatalf("restored previous alias ttl = %v, want %v", ttl, ClaudeThinkingReplayCacheTTL)
+	}
+}
+
+func TestClaudeThinkingReplayAliasHomeRollBackTombstonesUnindexedPrevious(t *testing.T) {
+	ClearClaudeThinkingReplayCache()
+	defer ClearClaudeThinkingReplayCache()
+	ctx := context.Background()
+	const modelFamily = "claude:test"
+	messageHash := "msg"
+	aliasKey := claudeThinkingReplayAliasKVKey(modelFamily, messageHash)
+	indexKey := claudeThinkingReplayAliasIndexKVKey(modelFamily)
+
+	now := time.Now()
+	// Worker A committed from absence and never indexed. Worker B observed that
+	// value as previousAliasRaw, committed its own value, and also failed to index.
+	previous := claudeThinkingReplayAliasHomeValue{Sessions: []claudeThinkingReplayAliasHomeSession{{SessionKey: "worker-a", FirstUserHash: "first", Timestamp: now}}}
+	previousRaw, _ := json.Marshal(previous)
+	committed := claudeThinkingReplayAliasHomeValue{Sessions: []claudeThinkingReplayAliasHomeSession{
+		{SessionKey: "worker-a", FirstUserHash: "first", Timestamp: now},
+		{SessionKey: "worker-b", FirstUserHash: "first", Timestamp: now},
+	}}
+	committedRaw, _ := json.Marshal(committed)
+
+	client := newFakeClaudeThinkingReplayKVClient()
+	client.values[aliasKey] = append([]byte(nil), committedRaw...)
+	useFakeClaudeThinkingReplayKVClient(t, client, true)
+
+	rollBackClaudeThinkingReplayAliasHome(ctx, client, aliasKey, indexKey, committedRaw, previousRaw, now)
+
+	if aliasValueIsLive(client.values[aliasKey]) {
+		t.Fatalf("unindexed previous alias was restored with full TTL; expected tombstone")
+	}
+	if ttl, ok := client.swapsTTLs[aliasKey]; !ok || ttl != claudeThinkingReplayAliasTombstoneTTL {
+		t.Fatalf("unindexed previous rollback ttl = %v, want %v", ttl, claudeThinkingReplayAliasTombstoneTTL)
+	}
+}
+
+func TestClaudeThinkingReplayAliasHomeRollBackTombstonesPreviousWhenIndexUnreadable(t *testing.T) {
+	ClearClaudeThinkingReplayCache()
+	defer ClearClaudeThinkingReplayCache()
+	ctx := context.Background()
+	const modelFamily = "claude:test"
+	messageHash := "msg"
+	aliasKey := claudeThinkingReplayAliasKVKey(modelFamily, messageHash)
+	indexKey := claudeThinkingReplayAliasIndexKVKey(modelFamily)
+
+	now := time.Now()
+	previous := claudeThinkingReplayAliasHomeValue{Sessions: []claudeThinkingReplayAliasHomeSession{{SessionKey: "old", FirstUserHash: "first", Timestamp: now}}}
+	previousRaw, _ := json.Marshal(previous)
+	committed := claudeThinkingReplayAliasHomeValue{Sessions: []claudeThinkingReplayAliasHomeSession{
+		{SessionKey: "old", FirstUserHash: "first", Timestamp: now},
+		{SessionKey: "new", FirstUserHash: "first", Timestamp: now},
+	}}
+	committedRaw, _ := json.Marshal(committed)
+
+	base := newFakeClaudeThinkingReplayKVClient()
+	base.values[aliasKey] = append([]byte(nil), committedRaw...)
+	client := &indexGetFailingClaudeThinkingReplayKVClient{
+		fakeClaudeThinkingReplayKVClient: base,
+		indexKey:                         indexKey,
+	}
+	useFakeClaudeThinkingReplayKVClient(t, client, true)
+
+	rollBackClaudeThinkingReplayAliasHome(ctx, client, aliasKey, indexKey, committedRaw, previousRaw, now)
+
+	if aliasValueIsLive(client.values[aliasKey]) {
+		t.Fatalf("previous alias restored without index confirmation; expected tombstone")
+	}
+	if ttl, ok := client.swapsTTLs[aliasKey]; !ok || ttl != claudeThinkingReplayAliasTombstoneTTL {
+		t.Fatalf("unconfirmed previous rollback ttl = %v, want %v", ttl, claudeThinkingReplayAliasTombstoneTTL)
 	}
 }
 

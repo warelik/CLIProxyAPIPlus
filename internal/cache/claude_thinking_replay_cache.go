@@ -849,14 +849,15 @@ func registerClaudeThinkingReplayAliasHome(ctx context.Context, client kimiThink
 	}
 }
 
-// rollBackClaudeThinkingReplayAliasHome rolls an alias value back to the
-// previous value that existed before an unindexed commit. If there was no
-// previous value, it leaves an empty tombstone so the alias resolves to nothing
-// rather than a stale unindexed orphan. The rollback is conditional on the
-// committed value: if the alias still contains the exact bytes we wrote, it is
-// an orphan and should be removed. The index is consulted only as a best-effort
-// guard when it is readable; a failing index read does not prevent rollback
-// because the failed registration is precisely what produced the orphan.
+// rollBackClaudeThinkingReplayAliasHome rolls an alias value back after an
+// unindexed commit. The rollback is conditional on the committed bytes still
+// being present: a concurrent re-registration is left alone. A fresh index
+// record (timestamp >= now) means another worker made this commit durable, so
+// the current value is kept. Otherwise the prior value is restored only when
+// the index still lists this alias key — presence proves a prior registration
+// was durable and keeps the key under the credential cap. An unindexed prior
+// (including a concurrent worker's still-unindexed commit) and an unreadable
+// index both get a short-lived empty tombstone rather than a full-TTL restore.
 func rollBackClaudeThinkingReplayAliasHome(ctx context.Context, client kimiThinkingReplayKVClient, aliasKey, indexKey string, committedAliasRaw, previousAliasRaw []byte, now time.Time) {
 	if len(committedAliasRaw) == 0 {
 		return
@@ -869,19 +870,16 @@ func rollBackClaudeThinkingReplayAliasHome(ctx context.Context, client kimiThink
 		return
 	}
 
-	// If we can confirm the alias is live in the index, another worker must
-	// have made it durable; leave it alone. The record must be from this
-	// registration (timestamp >= now); an older record means the index does not
-	// reflect the committed value and the alias will expire uncapped.
+	indexed := false
 	indexRaw, _, errIndex := client.KVGet(ctx, indexKey)
 	if errIndex == nil {
 		if index, ok := decodeClaudeThinkingReplayAliasIndex(indexRaw); ok {
 			for _, a := range index.Aliases {
 				if a.AliasKey == aliasKey {
+					indexed = true
 					if !a.Timestamp.Before(now) {
 						return
 					}
-					// Stale index record: keep rolling back.
 					break
 				}
 			}
@@ -890,13 +888,9 @@ func rollBackClaudeThinkingReplayAliasHome(ctx context.Context, client kimiThink
 		log.Warnf("claude thinking replay alias rollback index check failed: %v", errIndex)
 	}
 
-	// Roll the alias value back to the previous value if there was one;
-	// otherwise leave an empty tombstone. The CAS is conditional on the current
-	// value still matching the committed value, so a concurrent re-registration
-	// cannot be overwritten.
 	var replacement []byte
 	ttl := claudeThinkingReplayAliasTombstoneTTL
-	if len(previousAliasRaw) > 0 {
+	if len(previousAliasRaw) > 0 && indexed {
 		replacement = append([]byte(nil), previousAliasRaw...)
 		ttl = ClaudeThinkingReplayCacheTTL
 	} else {
