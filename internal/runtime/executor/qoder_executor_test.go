@@ -260,8 +260,7 @@ func TestExecuteStream_PublishesUsageRecordFromStreamUsage(t *testing.T) {
 		Storage:  storage,
 	}
 
-	plugin := &captureQoderUsagePlugin{records: make(chan usage.Record, 4)}
-	usage.RegisterNamedPlugin("test:qoder-stream-usage", plugin)
+	plugin := registerCaptureQoderUsagePlugin(t, "test:qoder-stream-usage", authRecord.ID, "auto")
 
 	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", qoderRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 		return qoderSSEHTTPResponse(req, http.StatusOK, qoderStreamBodyWithUsage(t, 3, 4, 7)), nil
@@ -295,6 +294,24 @@ func TestExecuteStream_PublishesUsageRecordFromStreamUsage(t *testing.T) {
 	}
 }
 
+func TestCaptureQoderUsagePluginAcceptsMatchAfterForeignFill(t *testing.T) {
+	plugin := registerCaptureQoderUsagePlugin(t, "test:qoder-foreign-fill", "qoder-stream-usage-auth", "auto")
+	for i := 0; i < 8; i++ {
+		plugin.HandleUsage(context.Background(), usage.Record{Provider: "flood", AuthID: "flood", Model: "m"})
+	}
+	plugin.HandleUsage(context.Background(), usage.Record{
+		Provider:     "qoder",
+		AuthID:       "qoder-stream-usage-auth",
+		Model:        "auto",
+		ExecutorType: "QoderExecutor",
+		Detail:       usage.Detail{InputTokens: 3, OutputTokens: 4, TotalTokens: 7},
+	})
+	record := waitForQoderUsageRecord(t, plugin.records, "qoder-stream-usage-auth", "auto")
+	if record.Detail.InputTokens != 3 || record.Detail.OutputTokens != 4 || record.Detail.TotalTokens != 7 {
+		t.Fatalf("Detail = %+v, want input=3 output=4 total=7", record.Detail)
+	}
+}
+
 func TestWaitForQoderUsageRecord_RequiresMatchingAuthID(t *testing.T) {
 	const expectedAuthID = "qoder-stream-usage-auth"
 	records := make(chan usage.Record, 2)
@@ -316,8 +333,7 @@ func TestExecuteStream_PublishesFailureRecordForUpstreamStatus(t *testing.T) {
 		Storage:  storage,
 	}
 
-	plugin := &captureQoderUsagePlugin{records: make(chan usage.Record, 4)}
-	usage.RegisterNamedPlugin("test:qoder-status-failure", plugin)
+	plugin := registerCaptureQoderUsagePlugin(t, "test:qoder-status-failure", authRecord.ID, "auto")
 
 	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", qoderRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 		return qoderSSEHTTPResponse(req, http.StatusServiceUnavailable, "upstream down"), nil
@@ -355,8 +371,7 @@ func TestExecuteStream_EnsuresUsageRecordForRawDoneWithoutUsage(t *testing.T) {
 		Storage:  storage,
 	}
 
-	plugin := &captureQoderUsagePlugin{records: make(chan usage.Record, 4)}
-	usage.RegisterNamedPlugin("test:qoder-raw-done", plugin)
+	plugin := registerCaptureQoderUsagePlugin(t, "test:qoder-raw-done", authRecord.ID, "auto")
 
 	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", qoderRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 		return qoderSSEHTTPResponse(req, http.StatusOK, "data: [DONE]\n\n"), nil
@@ -394,8 +409,7 @@ func TestExecuteStream_PublishesFailureRecordForStreamEnvelopeStatus(t *testing.
 		Storage:  storage,
 	}
 
-	plugin := &captureQoderUsagePlugin{records: make(chan usage.Record, 4)}
-	usage.RegisterNamedPlugin("test:qoder-envelope-failure", plugin)
+	plugin := registerCaptureQoderUsagePlugin(t, "test:qoder-envelope-failure", authRecord.ID, "auto")
 
 	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", qoderRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 		body := qoderStreamBodyWithStatus(t, http.StatusTooManyRequests, "quota exhausted")
@@ -460,10 +474,35 @@ func (f qoderRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error)
 
 type captureQoderUsagePlugin struct {
 	records chan usage.Record
+	authID  string
+	model   string
+}
+
+func registerCaptureQoderUsagePlugin(t *testing.T, name, authID, model string) *captureQoderUsagePlugin {
+	t.Helper()
+	plugin := &captureQoderUsagePlugin{
+		records: make(chan usage.Record, 4),
+		authID:  authID,
+		model:   model,
+	}
+	usage.RegisterNamedPlugin(name, plugin)
+	t.Cleanup(func() {
+		usage.RegisterNamedPlugin(name, &captureQoderUsagePlugin{})
+	})
+	return plugin
 }
 
 func (p *captureQoderUsagePlugin) HandleUsage(_ context.Context, record usage.Record) {
-	if p == nil {
+	if p == nil || p.records == nil {
+		return
+	}
+	if record.Provider != "qoder" {
+		return
+	}
+	if p.authID != "" && record.AuthID != p.authID {
+		return
+	}
+	if p.model != "" && record.Model != p.model {
 		return
 	}
 	select {

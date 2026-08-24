@@ -248,6 +248,10 @@ func TestWebsocketRetryBindFailureClearsActiveSessionState(t *testing.T) {
 					return
 				}
 				if connection == 2 {
+					// Hold until the client closes after bind failure. A server-side
+					// return here is a 1006 trap: a later dial can still be numbered 2
+					// if this handler has not yet run connections.Add.
+					_, _, _ = conn.ReadMessage()
 					return
 				}
 				if _, _, errRead := conn.ReadMessage(); errRead != nil {
@@ -281,6 +285,13 @@ func TestWebsocketRetryBindFailureClearsActiveSessionState(t *testing.T) {
 			if active {
 				t.Fatal("retry bind failure left the old active websocket state")
 			}
+			sess.connMu.Lock()
+			leftoverConn := sess.conn != nil
+			sess.connMu.Unlock()
+			if leftoverConn {
+				t.Fatal("retry bind failure left sess.conn set")
+			}
+			waitForWebsocketConnectionCount(t, &connections, 2)
 
 			opts.ExecutionLifecycle = nil
 			if errRun := run(opts); errRun != nil {
@@ -290,6 +301,24 @@ func TestWebsocketRetryBindFailureClearsActiveSessionState(t *testing.T) {
 				t.Fatalf("websocket connections = %d, want 3 after retry bind failure", got)
 			}
 		})
+	}
+}
+
+func waitForWebsocketConnectionCount(t *testing.T, connections *atomic.Int32, want int32) {
+	t.Helper()
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if connections.Load() >= want {
+			return
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("timed out waiting for %d websocket connections, have %d", want, connections.Load())
+		case <-ticker.C:
+		}
 	}
 }
 
