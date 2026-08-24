@@ -373,17 +373,22 @@ func TestClaudeThinkingReplayCallerHash_IgnoresWhitespaceOnlyHeaders(t *testing.
 // Strict Claude validation accepts. InspectClaudeSignaturePayload requires:
 // decoded[0]==0x12, top-level field 2 (bytes) holding a channel block with
 // required channel_id (field 1 varint 12), infra (field 2 varint 2), and
-// model_text (field 6, "claude-sonnet-4-6"). EgI= is not this: it is a
-// truncated length-delimited tag (field 2 / wire 2, claimed length 2, zero
-// payload bytes) and Strict rejects it.
-func strictValidClaudeThinkingSignature() string {
+// model_text (field 6). Distinct modelText values produce distinct blobs so
+// isolation tests can observe a leaked restore after sanitizer Preserve.
+// EgI= is not this: it is a truncated length-delimited tag (field 2 / wire 2,
+// claimed length 2, zero payload bytes) and Strict rejects it.
+func strictValidClaudeThinkingSignature(modelText ...string) string {
+	text := "claude-sonnet-4-6"
+	if len(modelText) > 0 && modelText[0] != "" {
+		text = modelText[0]
+	}
 	channelBlock := []byte{}
 	channelBlock = protowire.AppendTag(channelBlock, 1, protowire.VarintType)
 	channelBlock = protowire.AppendVarint(channelBlock, 12)
 	channelBlock = protowire.AppendTag(channelBlock, 2, protowire.VarintType)
 	channelBlock = protowire.AppendVarint(channelBlock, 2)
 	channelBlock = protowire.AppendTag(channelBlock, 6, protowire.BytesType)
-	channelBlock = protowire.AppendString(channelBlock, "claude-sonnet-4-6")
+	channelBlock = protowire.AppendString(channelBlock, text)
 
 	container := []byte{}
 	container = protowire.AppendTag(container, 1, protowire.BytesType)
@@ -517,7 +522,7 @@ func TestClaudeExecutorCompatThinkingReplayRestoresOmittedBlock(t *testing.T) {
 
 		w.Header().Set("Content-Type", "application/json")
 		if call == 1 {
-			_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning","signature":"EgI="},{"type":"tool_use","id":"toolu_1","name":"Read","input":{"path":"README.md"}}],"stop_reason":"tool_use"}`))
+			_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning","signature":"` + strictValidClaudeThinkingSignature() + `"},{"type":"tool_use","id":"toolu_1","name":"Read","input":{"path":"README.md"}}],"stop_reason":"tool_use"}`))
 			return
 		}
 		_, _ = w.Write([]byte(`{"id":"msg-2","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"}`))
@@ -550,10 +555,69 @@ func TestClaudeExecutorCompatThinkingReplayRestoresOmittedBlock(t *testing.T) {
 	if got := content[0].Get("type").String(); got != "thinking" {
 		t.Fatalf("restored first content type = %q, want thinking", got)
 	}
-	// Cache-born EgI= is not a Claude envelope. Restore the omitted block;
-	// sanitizer must clear the signature before the compat upstream sees it.
-	if got := content[0].Get("signature").String(); got != "" {
-		t.Fatalf("restored signature = %q, want empty", got)
+	if got := content[0].Get("signature").String(); got != strictValidClaudeThinkingSignature() {
+		t.Fatalf("restored signature = %q, want Strict-valid Claude envelope", got)
+	}
+}
+
+func TestClaudeExecutorCompatThinkingReplayDoesNotCacheEgIFragment(t *testing.T) {
+	internalcacheClearClaudeThinkingReplay(t)
+
+	var mu sync.Mutex
+	var requestBodies [][]byte
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, errRead := io.ReadAll(r.Body)
+		if errRead != nil {
+			t.Errorf("read request body: %v", errRead)
+			return
+		}
+		mu.Lock()
+		requestBodies = append(requestBodies, bytes.Clone(body))
+		callCount++
+		call := callCount
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		if call == 1 {
+			_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning","signature":"EgI="},{"type":"tool_use","id":"toolu_1","name":"Read","input":{"path":"README.md"}}],"stop_reason":"tool_use"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"msg-2","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"}`))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(nil)
+	auth := claudeReplayTestAuth(server.URL)
+	firstPayload := []byte(`{"messages":[{"role":"user","content":"inspect"}]}`)
+	firstRequest, firstOptions := claudeReplayTestRequest(firstPayload, "egi-not-cached", true, sdktranslator.FormatClaude)
+	if _, errExecute := executor.Execute(context.Background(), auth, firstRequest, firstOptions); errExecute != nil {
+		t.Fatalf("first Execute() error = %v", errExecute)
+	}
+
+	scope := claudeThinkingReplayScopeFromRequest(context.Background(), auth, firstRequest, firstOptions)
+	_, _, found, errGet := internalcache.GetClaudeThinkingReplayWithSnapshotIfExists(context.Background(), scope.modelFamily, scope.sessionKey)
+	if errGet != nil {
+		t.Fatalf("cache read after EgI= response: %v", errGet)
+	}
+	if found {
+		t.Fatal("truncated EgI= fragment must not be written to the replay cache")
+	}
+
+	secondPayload := []byte(`{"messages":[{"role":"user","content":"inspect"},{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"path":"README.md"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}]}`)
+	secondRequest, secondOptions := claudeReplayTestRequest(secondPayload, "egi-not-cached", true, sdktranslator.FormatClaude)
+	if _, errExecute := executor.Execute(context.Background(), auth, secondRequest, secondOptions); errExecute != nil {
+		t.Fatalf("second Execute() error = %v", errExecute)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(requestBodies) != 2 {
+		t.Fatalf("upstream request count = %d, want 2", len(requestBodies))
+	}
+	content := gjson.GetBytes(requestBodies[1], "messages.1.content").Array()
+	if len(content) != 1 || content[0].Get("type").String() != "tool_use" {
+		t.Fatalf("EgI= turn was restored from cache: %s", gjson.GetBytes(requestBodies[1], "messages.1.content").Raw)
 	}
 }
 
@@ -620,8 +684,8 @@ func TestClaudeExecutorCompatThinkingReplayRestoresOmittedBlockInStream(t *testi
 	if len(content) != 2 || content[0].Get("type").String() != "thinking" {
 		t.Fatalf("second streamed assistant content = %s, want restored thinking and tool_use", gjson.GetBytes(requestBodies[1], "messages.1.content").Raw)
 	}
-	if got := content[0].Get("signature").String(); got != "" {
-		t.Fatalf("restored streamed signature = %q, want empty", got)
+	if got := content[0].Get("signature").String(); got != strictValidClaudeThinkingSignature() {
+		t.Fatalf("restored streamed signature = %q, want Strict-valid Claude envelope", got)
 	}
 }
 
@@ -754,7 +818,7 @@ func TestClaudeExecutorCompatThinkingReplayPreservesValidClaudeSignatureInStream
 }
 
 func claudeReplayThinkingStream() string {
-	return claudeReplayThinkingStreamWithSignature("EgI=")
+	return claudeReplayThinkingStreamWithSignature(strictValidClaudeThinkingSignature())
 }
 
 func claudeReplayThinkingStreamWithSignature(sig string) string {
@@ -801,7 +865,7 @@ func TestClaudeExecutorCompatThinkingReplayRestoresBeforeMCPToolNameRemap(t *tes
 			// The upstream tool name is the alias; echo it back so the cache stores
 			// the caller-facing name after restoreClaudeOAuthToolNamesFromResponse.
 			aliasName := gjson.GetBytes(body, "tools.0.name").String()
-			_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning","signature":"EgI="},{"type":"tool_use","id":"toolu_1","name":"` + aliasName + `","input":{"path":"README.md"}}],"stop_reason":"tool_use"}`))
+			_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning","signature":"` + strictValidClaudeThinkingSignature() + `"},{"type":"tool_use","id":"toolu_1","name":"` + aliasName + `","input":{"path":"README.md"}}],"stop_reason":"tool_use"}`))
 			return
 		}
 		_, _ = w.Write([]byte(`{"id":"msg-2","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"}`))
@@ -838,8 +902,8 @@ func TestClaudeExecutorCompatThinkingReplayRestoresBeforeMCPToolNameRemap(t *tes
 	if got := secondContent[0].Get("type").String(); got != "thinking" {
 		t.Fatalf("restored first content type = %q, want thinking", got)
 	}
-	if got := secondContent[0].Get("signature").String(); got != "" {
-		t.Fatalf("restored signature = %q, want empty", got)
+	if got := secondContent[0].Get("signature").String(); got != strictValidClaudeThinkingSignature() {
+		t.Fatalf("restored signature = %q, want Strict-valid Claude envelope", got)
 	}
 
 	// The restored tool_use name must be remapped for upstream, matching the
@@ -876,7 +940,7 @@ func TestClaudeExecutorCompatThinkingReplayRestoresOmittedThinkingWithToolProven
 			// Upstream returns a tool_use carrying provenance fields the sanitizer
 			// would strip before the replay match if the cached parts were not
 			// normalized.
-			_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning","signature":"EgI="},{"type":"tool_use","id":"toolu_1","name":"Read","input":{"path":"README.md"},"signature":"bad","thoughtSignature":"bad","extra_content":{"google":{"thought_signature":"bad"}},"model":"claude-synthetic-4772"}],"stop_reason":"tool_use"}`))
+			_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning","signature":"` + strictValidClaudeThinkingSignature() + `"},{"type":"tool_use","id":"toolu_1","name":"Read","input":{"path":"README.md"},"signature":"bad","thoughtSignature":"bad","extra_content":{"google":{"thought_signature":"bad"}},"model":"claude-synthetic-4772"}],"stop_reason":"tool_use"}`))
 			return
 		}
 		_, _ = w.Write([]byte(`{"id":"msg-2","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"}`))
@@ -911,8 +975,8 @@ func TestClaudeExecutorCompatThinkingReplayRestoresOmittedThinkingWithToolProven
 	if got := content[0].Get("type").String(); got != "thinking" {
 		t.Fatalf("restored first content type = %q, want thinking", got)
 	}
-	if got := content[0].Get("signature").String(); got != "" {
-		t.Fatalf("restored signature = %q, want empty", got)
+	if got := content[0].Get("signature").String(); got != strictValidClaudeThinkingSignature() {
+		t.Fatalf("restored signature = %q, want Strict-valid Claude envelope", got)
 	}
 	if got := content[1].Get("signature").String(); got != "" {
 		t.Fatalf("restored tool_use still carried a signature: %q", got)
@@ -927,7 +991,7 @@ func TestClaudeExecutorCompatThinkingReplayClearsAfterUpstreamBadRequest(t *test
 		callCount++
 		if callCount == 1 {
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"reasoning","signature":"EgI="},{"type":"tool_use","id":"toolu-1","name":"Read","input":{"path":"README.md"}}],"stop_reason":"tool_use"}`))
+			_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"reasoning","signature":"` + strictValidClaudeThinkingSignature() + `"},{"type":"tool_use","id":"toolu-1","name":"Read","input":{"path":"README.md"}}],"stop_reason":"tool_use"}`))
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -977,9 +1041,9 @@ func TestClaudeExecutorCompatThinkingReplayRestoresMultipleOmittedBlocks(t *test
 		w.Header().Set("Content-Type", "application/json")
 		switch call {
 		case 1:
-			_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"first","signature":"EgI="},{"type":"tool_use","id":"toolu-1","name":"Read","input":{"path":"one"}}],"stop_reason":"tool_use"}`))
+			_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"first","signature":"` + strictValidClaudeThinkingSignature() + `"},{"type":"tool_use","id":"toolu-1","name":"Read","input":{"path":"one"}}],"stop_reason":"tool_use"}`))
 		case 2:
-			_, _ = w.Write([]byte(`{"id":"msg-2","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"second","signature":"EgM="},{"type":"tool_use","id":"toolu-2","name":"Read","input":{"path":"two"}}],"stop_reason":"tool_use"}`))
+			_, _ = w.Write([]byte(`{"id":"msg-2","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"second","signature":"` + strictValidClaudeThinkingSignature("claude-opus-4-6") + `"},{"type":"tool_use","id":"toolu-2","name":"Read","input":{"path":"two"}}],"stop_reason":"tool_use"}`))
 		default:
 			_, _ = w.Write([]byte(`{"id":"msg-3","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"}`))
 		}
@@ -1012,15 +1076,15 @@ func TestClaudeExecutorCompatThinkingReplayRestoresMultipleOmittedBlocks(t *test
 	}
 	firstContent := gjson.GetBytes(requestBodies[2], "messages.1.content").Array()
 	secondContent := gjson.GetBytes(requestBodies[2], "messages.3.content").Array()
-	if len(firstContent) != 2 || firstContent[0].Get("type").String() != "thinking" || firstContent[0].Get("signature").String() != "" {
-		t.Fatalf("first omitted turn was not restored with empty signature: %s", gjson.GetBytes(requestBodies[2], "messages.1.content").Raw)
+	if len(firstContent) != 2 || firstContent[0].Get("type").String() != "thinking" || firstContent[0].Get("signature").String() != strictValidClaudeThinkingSignature() {
+		t.Fatalf("first omitted turn was not restored with Strict-valid signature: %s", gjson.GetBytes(requestBodies[2], "messages.1.content").Raw)
 	}
-	if len(secondContent) != 2 || secondContent[0].Get("type").String() != "thinking" || secondContent[0].Get("signature").String() != "" {
-		t.Fatalf("second omitted turn was not restored with empty signature: %s", gjson.GetBytes(requestBodies[2], "messages.3.content").Raw)
+	if len(secondContent) != 2 || secondContent[0].Get("type").String() != "thinking" || secondContent[0].Get("signature").String() != strictValidClaudeThinkingSignature("claude-opus-4-6") {
+		t.Fatalf("second omitted turn was not restored with Strict-valid signature: %s", gjson.GetBytes(requestBodies[2], "messages.3.content").Raw)
 	}
 }
 
-func TestClaudeExecutorCompatThinkingReplayRestoresOpaqueOmittedBlock(t *testing.T) {
+func TestClaudeExecutorCompatThinkingReplayDoesNotCacheOpaqueEnvelope(t *testing.T) {
 	internalcacheClearClaudeThinkingReplay(t)
 
 	opaque := bytes.Repeat([]byte{0x12, 0xff, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33}, 4)
@@ -1053,13 +1117,22 @@ func TestClaudeExecutorCompatThinkingReplayRestoresOpaqueOmittedBlock(t *testing
 	executor := NewClaudeExecutor(nil)
 	auth := claudeReplayTestAuth(server.URL)
 	firstPayload := []byte(`{"messages":[{"role":"user","content":"inspect"}]}`)
-	firstRequest, firstOptions := claudeReplayTestRequest(firstPayload, "opaque-replay", true, sdktranslator.FormatClaude)
+	firstRequest, firstOptions := claudeReplayTestRequest(firstPayload, "opaque-not-cached", true, sdktranslator.FormatClaude)
 	if _, errExecute := executor.Execute(context.Background(), auth, firstRequest, firstOptions); errExecute != nil {
 		t.Fatalf("first Execute() error = %v", errExecute)
 	}
 
+	scope := claudeThinkingReplayScopeFromRequest(context.Background(), auth, firstRequest, firstOptions)
+	_, _, found, errGet := internalcache.GetClaudeThinkingReplayWithSnapshotIfExists(context.Background(), scope.modelFamily, scope.sessionKey)
+	if errGet != nil {
+		t.Fatalf("cache read after opaque response: %v", errGet)
+	}
+	if found {
+		t.Fatal("opaque E-prefix blob must not be written to the replay cache")
+	}
+
 	secondPayload := []byte(`{"messages":[{"role":"user","content":"inspect"},{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"path":"README.md"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}]}`)
-	secondRequest, secondOptions := claudeReplayTestRequest(secondPayload, "opaque-replay", true, sdktranslator.FormatClaude)
+	secondRequest, secondOptions := claudeReplayTestRequest(secondPayload, "opaque-not-cached", true, sdktranslator.FormatClaude)
 	if _, errExecute := executor.Execute(context.Background(), auth, secondRequest, secondOptions); errExecute != nil {
 		t.Fatalf("second Execute() error = %v", errExecute)
 	}
@@ -1070,22 +1143,15 @@ func TestClaudeExecutorCompatThinkingReplayRestoresOpaqueOmittedBlock(t *testing
 		t.Fatalf("upstream request count = %d, want 2", len(requestBodies))
 	}
 	content := gjson.GetBytes(requestBodies[1], "messages.1.content").Array()
-	if len(content) != 2 {
-		t.Fatalf("second assistant content = %s, want thinking and tool_use", gjson.GetBytes(requestBodies[1], "messages.1.content").Raw)
-	}
-	if got := content[0].Get("type").String(); got != "thinking" {
-		t.Fatalf("restored first content type = %q, want thinking", got)
-	}
-	if got := content[0].Get("signature").String(); got != "" {
-		t.Fatalf("restored opaque signature = %q, want empty", got)
+	if len(content) != 1 || content[0].Get("type").String() != "tool_use" {
+		t.Fatalf("opaque turn was restored from cache: %s", gjson.GetBytes(requestBodies[1], "messages.1.content").Raw)
 	}
 }
 
 func TestClaudeExecutorCompatThinkingReplayRestoresEchoedSignedThinking(t *testing.T) {
 	internalcacheClearClaudeThinkingReplay(t)
 
-	opaque := bytes.Repeat([]byte{0x12, 0xff, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33}, 4)
-	opaqueSig := base64.StdEncoding.EncodeToString(opaque)
+	sig := strictValidClaudeThinkingSignature()
 
 	var mu sync.Mutex
 	var requestBodies [][]byte
@@ -1104,7 +1170,7 @@ func TestClaudeExecutorCompatThinkingReplayRestoresEchoedSignedThinking(t *testi
 
 		w.Header().Set("Content-Type", "application/json")
 		if call == 1 {
-			_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning","signature":"` + opaqueSig + `"},{"type":"tool_use","id":"toolu_1","name":"Read","input":{"path":"README.md"}}],"stop_reason":"tool_use"}`))
+			_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning","signature":"` + sig + `"},{"type":"tool_use","id":"toolu_1","name":"Read","input":{"path":"README.md"}}],"stop_reason":"tool_use"}`))
 			return
 		}
 		_, _ = w.Write([]byte(`{"id":"msg-2","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"}`))
@@ -1120,9 +1186,9 @@ func TestClaudeExecutorCompatThinkingReplayRestoresEchoedSignedThinking(t *testi
 	}
 
 	// Client echoes the complete assistant content, including the signed thinking
-	// block. Restore may overlay the cache; sanitizer then clears the opaque
-	// signature before the compat upstream sees it.
-	secondPayload := []byte(`{"messages":[{"role":"user","content":"inspect"},{"role":"assistant","content":[{"type":"thinking","thinking":"provider reasoning","signature":"` + opaqueSig + `"},{"type":"tool_use","id":"toolu_1","name":"Read","input":{"path":"README.md"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}]}`)
+	// block. Restore may overlay the cache; sanitizer Preserve keeps the
+	// Strict-valid envelope.
+	secondPayload := []byte(`{"messages":[{"role":"user","content":"inspect"},{"role":"assistant","content":[{"type":"thinking","thinking":"provider reasoning","signature":"` + sig + `"},{"type":"tool_use","id":"toolu_1","name":"Read","input":{"path":"README.md"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}]}`)
 	secondRequest, secondOptions := claudeReplayTestRequest(secondPayload, "echoed-replay", true, sdktranslator.FormatClaude)
 	if _, errExecute := executor.Execute(context.Background(), auth, secondRequest, secondOptions); errExecute != nil {
 		t.Fatalf("second Execute() error = %v", errExecute)
@@ -1140,16 +1206,15 @@ func TestClaudeExecutorCompatThinkingReplayRestoresEchoedSignedThinking(t *testi
 	if got := content[0].Get("type").String(); got != "thinking" {
 		t.Fatalf("restored first content type = %q, want thinking", got)
 	}
-	if got := content[0].Get("signature").String(); got != "" {
-		t.Fatalf("restored opaque signature = %q, want empty", got)
+	if got := content[0].Get("signature").String(); got != sig {
+		t.Fatalf("restored signature = %q, want Strict-valid Claude envelope", got)
 	}
 }
 
 func TestClaudeExecutorCompatThinkingReplayRestoresSessionlessSameUpstreamSignature(t *testing.T) {
 	internalcacheClearClaudeThinkingReplay(t)
 
-	opaque := bytes.Repeat([]byte{0x12, 0xff, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33}, 4)
-	opaqueSig := base64.StdEncoding.EncodeToString(opaque)
+	sig := strictValidClaudeThinkingSignature()
 
 	var mu sync.Mutex
 	var requestBodies [][]byte
@@ -1168,7 +1233,7 @@ func TestClaudeExecutorCompatThinkingReplayRestoresSessionlessSameUpstreamSignat
 
 		w.Header().Set("Content-Type", "application/json")
 		if call == 1 {
-			_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning","signature":"` + opaqueSig + `"},{"type":"tool_use","id":"toolu_1","name":"Read","input":{"path":"README.md"}}],"stop_reason":"tool_use"}`))
+			_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning","signature":"` + sig + `"},{"type":"tool_use","id":"toolu_1","name":"Read","input":{"path":"README.md"}}],"stop_reason":"tool_use"}`))
 			return
 		}
 		_, _ = w.Write([]byte(`{"id":"msg-2","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"}`))
@@ -1203,18 +1268,16 @@ func TestClaudeExecutorCompatThinkingReplayRestoresSessionlessSameUpstreamSignat
 	if got := content[0].Get("type").String(); got != "thinking" {
 		t.Fatalf("restored first content type = %q, want thinking", got)
 	}
-	if got := content[0].Get("signature").String(); got != "" {
-		t.Fatalf("sessionless restored signature = %q, want empty", got)
+	if got := content[0].Get("signature").String(); got != sig {
+		t.Fatalf("sessionless restored signature = %q, want Strict-valid Claude envelope", got)
 	}
 }
 
 func TestClaudeExecutorCompatThinkingReplayIsConversationScopedForSessionlessClients(t *testing.T) {
 	internalcacheClearClaudeThinkingReplay(t)
 
-	opaqueA := bytes.Repeat([]byte{0x12, 0xff, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33}, 4)
-	opaqueSigA := base64.StdEncoding.EncodeToString(opaqueA)
-	opaqueB := bytes.Repeat([]byte{0x12, 0x99, 0x99, 0x99, 0x22, 0x33, 0x44, 0x55}, 4)
-	opaqueSigB := base64.StdEncoding.EncodeToString(opaqueB)
+	sigA := strictValidClaudeThinkingSignature("claude-sonnet-4-6")
+	sigB := strictValidClaudeThinkingSignature("claude-opus-4-6")
 
 	var mu sync.Mutex
 	var requestBodies [][]byte
@@ -1233,11 +1296,11 @@ func TestClaudeExecutorCompatThinkingReplayIsConversationScopedForSessionlessCli
 
 		w.Header().Set("Content-Type", "application/json")
 		if call == 1 {
-			_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning A","signature":"` + opaqueSigA + `"},{"type":"tool_use","id":"toolu_A","name":"Read","input":{"path":"A"}}],"stop_reason":"tool_use"}`))
+			_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning A","signature":"` + sigA + `"},{"type":"tool_use","id":"toolu_A","name":"Read","input":{"path":"A"}}],"stop_reason":"tool_use"}`))
 			return
 		}
 		if call == 2 {
-			_, _ = w.Write([]byte(`{"id":"msg-2","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning B","signature":"` + opaqueSigB + `"},{"type":"tool_use","id":"toolu_B","name":"Read","input":{"path":"B"}}],"stop_reason":"tool_use"}`))
+			_, _ = w.Write([]byte(`{"id":"msg-2","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning B","signature":"` + sigB + `"},{"type":"tool_use","id":"toolu_B","name":"Read","input":{"path":"B"}}],"stop_reason":"tool_use"}`))
 			return
 		}
 		_, _ = w.Write([]byte(`{"id":"msg-3","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"}`))
@@ -1275,11 +1338,12 @@ func TestClaudeExecutorCompatThinkingReplayIsConversationScopedForSessionlessCli
 		t.Fatalf("conversation B second Execute() error = %v", errExecute)
 	}
 
-	// Conversation B third turn: uses the same assistant content as conversation A.
-	// Because the first user message differs, the cache for conversation B must not
-	// contain conversation A's signature, so the previous assistant signature is
-	// not restored.
-	thirdBReq, thirdBOpts := claudeReplayTestRequest([]byte(`{"messages":[{"role":"user","content":"task B"},{"role":"assistant","content":[{"type":"thinking","thinking":"provider reasoning A","signature":"`+opaqueSigA+`"},{"type":"tool_use","id":"toolu_A","name":"Read","input":{"path":"A"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_A","content":"ok"}]}]}`), "", true, sdktranslator.FormatClaude)
+	// Conversation B third turn echoes A's tool_use without thinking. Isolation
+	// means B's cache holds tool_use B, so restore must not inject A's thinking.
+	// The leak marker that survives sanitizer is the thinking text (and the
+	// Strict-valid signature it would carry): a leaked restore would Preserve
+	// sigA, so an empty-signature check is not enough.
+	thirdBReq, thirdBOpts := claudeReplayTestRequest([]byte(`{"messages":[{"role":"user","content":"task B"},{"role":"assistant","content":[{"type":"tool_use","id":"toolu_A","name":"Read","input":{"path":"A"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_A","content":"ok"}]}]}`), "", true, sdktranslator.FormatClaude)
 	thirdBReq.Payload = claudeReplayPayloadWithConversationID(thirdBReq.Payload, "conv-B")
 	if _, errExecute := executor.Execute(context.Background(), auth, thirdBReq, thirdBOpts); errExecute != nil {
 		t.Fatalf("conversation B third Execute() error = %v", errExecute)
@@ -1295,31 +1359,32 @@ func TestClaudeExecutorCompatThinkingReplayIsConversationScopedForSessionlessCli
 	if aContent[0].Get("type").String() != "thinking" || aContent[0].Get("thinking").String() != "provider reasoning A" {
 		t.Fatalf("conversation A did not restore its own thinking: %s", gjson.GetBytes(requestBodies[2], "messages.1.content").Raw)
 	}
-	if aContent[0].Get("signature").String() != "" {
-		t.Fatalf("conversation A restored signature = %q, want empty", aContent[0].Get("signature").String())
+	if aContent[0].Get("signature").String() != sigA {
+		t.Fatalf("conversation A restored signature = %q, want A's Strict-valid envelope", aContent[0].Get("signature").String())
 	}
 
 	bContent := gjson.GetBytes(requestBodies[3], "messages.1.content").Array()
 	if bContent[0].Get("type").String() != "thinking" || bContent[0].Get("thinking").String() != "provider reasoning B" {
 		t.Fatalf("conversation B did not restore its own thinking: %s", gjson.GetBytes(requestBodies[3], "messages.1.content").Raw)
 	}
-	if bContent[0].Get("signature").String() != "" {
-		t.Fatalf("conversation B restored signature = %q, want empty", bContent[0].Get("signature").String())
+	if bContent[0].Get("signature").String() != sigB {
+		t.Fatalf("conversation B restored signature = %q, want B's Strict-valid envelope", bContent[0].Get("signature").String())
 	}
 
 	leakContent := gjson.GetBytes(requestBodies[4], "messages.1.content").Array()
-	if leakContent[0].Get("signature").String() != "" {
-		t.Fatalf("conversation B leaked conversation A's signature: %s", leakContent[0].Get("signature").String())
+	if len(leakContent) > 0 && leakContent[0].Get("type").String() == "thinking" {
+		t.Fatalf("conversation B leaked conversation A's thinking (text %q signature %q): %s", leakContent[0].Get("thinking").String(), leakContent[0].Get("signature").String(), gjson.GetBytes(requestBodies[4], "messages.1.content").Raw)
+	}
+	if len(leakContent) != 1 || leakContent[0].Get("type").String() != "tool_use" || leakContent[0].Get("id").String() != "toolu_A" {
+		t.Fatalf("conversation B third turn = %s, want A's tool_use without restored thinking", gjson.GetBytes(requestBodies[4], "messages.1.content").Raw)
 	}
 }
 
 func TestClaudeExecutorCompatThinkingReplayIsCallerScopedForSessionlessClients(t *testing.T) {
 	internalcacheClearClaudeThinkingReplay(t)
 
-	opaqueA := bytes.Repeat([]byte{0x12, 0xff, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33}, 4)
-	opaqueSigA := base64.StdEncoding.EncodeToString(opaqueA)
-	opaqueB := bytes.Repeat([]byte{0x12, 0x99, 0x99, 0x99, 0x22, 0x33, 0x44, 0x55}, 4)
-	opaqueSigB := base64.StdEncoding.EncodeToString(opaqueB)
+	sigA := strictValidClaudeThinkingSignature("claude-sonnet-4-6")
+	sigB := strictValidClaudeThinkingSignature("claude-opus-4-6")
 
 	var mu sync.Mutex
 	var requestBodies [][]byte
@@ -1338,11 +1403,11 @@ func TestClaudeExecutorCompatThinkingReplayIsCallerScopedForSessionlessClients(t
 
 		w.Header().Set("Content-Type", "application/json")
 		if call == 1 {
-			_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning A","signature":"` + opaqueSigA + `"},{"type":"tool_use","id":"toolu_1","name":"Read","input":{"path":"one"}}],"stop_reason":"tool_use"}`))
+			_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning A","signature":"` + sigA + `"},{"type":"tool_use","id":"toolu_1","name":"Read","input":{"path":"one"}}],"stop_reason":"tool_use"}`))
 			return
 		}
 		if call == 2 {
-			_, _ = w.Write([]byte(`{"id":"msg-2","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning B","signature":"` + opaqueSigB + `"},{"type":"tool_use","id":"toolu_1","name":"Read","input":{"path":"one"}}],"stop_reason":"tool_use"}`))
+			_, _ = w.Write([]byte(`{"id":"msg-2","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning B","signature":"` + sigB + `"},{"type":"tool_use","id":"toolu_1","name":"Read","input":{"path":"one"}}],"stop_reason":"tool_use"}`))
 			return
 		}
 		_, _ = w.Write([]byte(`{"id":"msg-3","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"}`))
@@ -1396,26 +1461,24 @@ func TestClaudeExecutorCompatThinkingReplayIsCallerScopedForSessionlessClients(t
 	if aContent[0].Get("type").String() != "thinking" || aContent[0].Get("thinking").String() != "provider reasoning A" {
 		t.Fatalf("caller A did not restore its own thinking: %s", gjson.GetBytes(requestBodies[2], "messages.1.content").Raw)
 	}
-	if aContent[0].Get("signature").String() != "" {
-		t.Fatalf("caller A restored signature = %q, want empty", aContent[0].Get("signature").String())
+	if aContent[0].Get("signature").String() != sigA {
+		t.Fatalf("caller A restored signature = %q, want A's Strict-valid envelope", aContent[0].Get("signature").String())
 	}
 
 	bContent := gjson.GetBytes(requestBodies[3], "messages.1.content").Array()
 	if bContent[0].Get("type").String() != "thinking" || bContent[0].Get("thinking").String() != "provider reasoning B" {
 		t.Fatalf("caller B did not restore its own thinking or leaked caller A's: %s", gjson.GetBytes(requestBodies[3], "messages.1.content").Raw)
 	}
-	if bContent[0].Get("signature").String() != "" {
-		t.Fatalf("caller B restored signature = %q, want empty", bContent[0].Get("signature").String())
+	if bContent[0].Get("signature").String() != sigB {
+		t.Fatalf("caller B restored signature = %q, want B's Strict-valid envelope", bContent[0].Get("signature").String())
 	}
 }
 
 func TestClaudeExecutorCompatThinkingReplayIdenticalOpeningsUseConversationNonce(t *testing.T) {
 	internalcacheClearClaudeThinkingReplay(t)
 
-	opaqueA := bytes.Repeat([]byte{0x12, 0xff, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33}, 4)
-	opaqueSigA := base64.StdEncoding.EncodeToString(opaqueA)
-	opaqueB := bytes.Repeat([]byte{0x12, 0x99, 0x99, 0x99, 0x22, 0x33, 0x44, 0x55}, 4)
-	opaqueSigB := base64.StdEncoding.EncodeToString(opaqueB)
+	sigA := strictValidClaudeThinkingSignature("claude-sonnet-4-6")
+	sigB := strictValidClaudeThinkingSignature("claude-opus-4-6")
 
 	var mu sync.Mutex
 	var requestBodies [][]byte
@@ -1434,11 +1497,11 @@ func TestClaudeExecutorCompatThinkingReplayIdenticalOpeningsUseConversationNonce
 
 		w.Header().Set("Content-Type", "application/json")
 		if call == 1 {
-			_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning A","signature":"` + opaqueSigA + `"},{"type":"tool_use","id":"toolu_A","name":"Read","input":{"path":"A"}}],"stop_reason":"tool_use"}`))
+			_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning A","signature":"` + sigA + `"},{"type":"tool_use","id":"toolu_A","name":"Read","input":{"path":"A"}}],"stop_reason":"tool_use"}`))
 			return
 		}
 		if call == 2 {
-			_, _ = w.Write([]byte(`{"id":"msg-2","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning B","signature":"` + opaqueSigB + `"},{"type":"tool_use","id":"toolu_A","name":"Read","input":{"path":"A"}}],"stop_reason":"tool_use"}`))
+			_, _ = w.Write([]byte(`{"id":"msg-2","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning B","signature":"` + sigB + `"},{"type":"tool_use","id":"toolu_A","name":"Read","input":{"path":"A"}}],"stop_reason":"tool_use"}`))
 			return
 		}
 		_, _ = w.Write([]byte(`{"id":"msg-3","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"}`))
@@ -1488,16 +1551,16 @@ func TestClaudeExecutorCompatThinkingReplayIdenticalOpeningsUseConversationNonce
 	if aContent[0].Get("type").String() != "thinking" || aContent[0].Get("thinking").String() != "provider reasoning A" {
 		t.Fatalf("conversation A did not restore its own thinking: %s", gjson.GetBytes(requestBodies[2], "messages.1.content").Raw)
 	}
-	if aContent[0].Get("signature").String() != "" {
-		t.Fatalf("conversation A restored signature = %q, want empty", aContent[0].Get("signature").String())
+	if aContent[0].Get("signature").String() != sigA {
+		t.Fatalf("conversation A restored signature = %q, want A's Strict-valid envelope", aContent[0].Get("signature").String())
 	}
 
 	bContent := gjson.GetBytes(requestBodies[3], "messages.1.content").Array()
 	if bContent[0].Get("type").String() != "thinking" || bContent[0].Get("thinking").String() != "provider reasoning B" {
 		t.Fatalf("conversation B did not restore its own thinking or leaked A's: %s", gjson.GetBytes(requestBodies[3], "messages.1.content").Raw)
 	}
-	if bContent[0].Get("signature").String() != "" {
-		t.Fatalf("conversation B restored signature = %q, want empty", bContent[0].Get("signature").String())
+	if bContent[0].Get("signature").String() != sigB {
+		t.Fatalf("conversation B restored signature = %q, want B's Strict-valid envelope", bContent[0].Get("signature").String())
 	}
 }
 
@@ -1524,7 +1587,7 @@ func TestClaudeExecutorCompatThinkingReplayRestoresSignedNonToolResponse(t *test
 			// Upstream returns a signed thinking block followed by a plain text
 			// answer with no tool_use. This must be cached and restored on the
 			// next user turn.
-			_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning","signature":"EgI="},{"type":"text","text":"The answer is 42"}],"stop_reason":"end_turn"}`))
+			_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning","signature":"` + strictValidClaudeThinkingSignature() + `"},{"type":"text","text":"The answer is 42"}],"stop_reason":"end_turn"}`))
 			return
 		}
 		_, _ = w.Write([]byte(`{"id":"msg-2","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}`))
@@ -1555,8 +1618,8 @@ func TestClaudeExecutorCompatThinkingReplayRestoresSignedNonToolResponse(t *test
 	if len(content) != 2 || content[0].Get("type").String() != "thinking" {
 		t.Fatalf("second assistant content = %s, want restored thinking and text", gjson.GetBytes(requestBodies[1], "messages.1.content").Raw)
 	}
-	if got := content[0].Get("signature").String(); got != "" {
-		t.Fatalf("restored signature = %q, want empty", got)
+	if got := content[0].Get("signature").String(); got != strictValidClaudeThinkingSignature() {
+		t.Fatalf("restored signature = %q, want Strict-valid Claude envelope", got)
 	}
 }
 
@@ -1580,7 +1643,7 @@ func TestClaudeExecutorCompatThinkingReplayRestoresAfterSensitiveWordObfuscation
 
 		w.Header().Set("Content-Type", "application/json")
 		if call == 1 {
-			_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning","signature":"EgI="},{"type":"text","text":"the secret answer"}],"stop_reason":"end_turn"}`))
+			_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning","signature":"` + strictValidClaudeThinkingSignature() + `"},{"type":"text","text":"the secret answer"}],"stop_reason":"end_turn"}`))
 			return
 		}
 		_, _ = w.Write([]byte(`{"id":"msg-2","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}`))
@@ -1614,8 +1677,8 @@ func TestClaudeExecutorCompatThinkingReplayRestoresAfterSensitiveWordObfuscation
 	if len(content) != 2 || content[0].Get("type").String() != "thinking" {
 		t.Fatalf("second assistant content = %s, want restored thinking and text", gjson.GetBytes(requestBodies[1], "messages.1.content").Raw)
 	}
-	if got := content[0].Get("signature").String(); got != "" {
-		t.Fatalf("restored signature = %q, want empty", got)
+	if got := content[0].Get("signature").String(); got != strictValidClaudeThinkingSignature() {
+		t.Fatalf("restored signature = %q, want Strict-valid Claude envelope", got)
 	}
 	text := content[1].Get("text").String()
 	if text == "the secret answer" {
@@ -1643,7 +1706,7 @@ func TestClaudeExecutorCompatThinkingReplaySkipsObfuscationWhenCloakingDisabled(
 
 		w.Header().Set("Content-Type", "application/json")
 		if call == 1 {
-			_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning","signature":"EgI="},{"type":"text","text":"the secret answer"}],"stop_reason":"end_turn"}`))
+			_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning","signature":"` + strictValidClaudeThinkingSignature() + `"},{"type":"text","text":"the secret answer"}],"stop_reason":"end_turn"}`))
 			return
 		}
 		_, _ = w.Write([]byte(`{"id":"msg-2","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}`))
@@ -1676,8 +1739,8 @@ func TestClaudeExecutorCompatThinkingReplaySkipsObfuscationWhenCloakingDisabled(
 	if len(content) != 2 || content[0].Get("type").String() != "thinking" {
 		t.Fatalf("second assistant content = %s, want restored thinking and text", gjson.GetBytes(requestBodies[1], "messages.1.content").Raw)
 	}
-	if got := content[0].Get("signature").String(); got != "" {
-		t.Fatalf("restored signature = %q, want empty", got)
+	if got := content[0].Get("signature").String(); got != strictValidClaudeThinkingSignature() {
+		t.Fatalf("restored signature = %q, want Strict-valid Claude envelope", got)
 	}
 	text := content[1].Get("text").String()
 	if text != "the secret answer" {
@@ -1728,7 +1791,7 @@ func TestClaudeExecutorCompatThinkingReplayRetainsSignedTurnAfterUnsignedRespons
 
 		w.Header().Set("Content-Type", "application/json")
 		if call == 1 {
-			_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning","signature":"EgI="},{"type":"text","text":"signed answer"}],"stop_reason":"end_turn"}`))
+			_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning","signature":"` + strictValidClaudeThinkingSignature() + `"},{"type":"text","text":"signed answer"}],"stop_reason":"end_turn"}`))
 			return
 		}
 		if call == 2 {
@@ -1766,7 +1829,7 @@ func TestClaudeExecutorCompatThinkingReplayRetainsSignedTurnAfterUnsignedRespons
 		t.Fatalf("upstream request count = %d, want 3", len(requestBodies))
 	}
 	firstAssistant := gjson.GetBytes(requestBodies[2], "messages.1.content").Array()
-	if firstAssistant[0].Get("type").String() != "thinking" || firstAssistant[0].Get("signature").String() != "" {
+	if firstAssistant[0].Get("type").String() != "thinking" || firstAssistant[0].Get("signature").String() != strictValidClaudeThinkingSignature() {
 		t.Fatalf("first signed turn not replayed after unsigned response: %s", gjson.GetBytes(requestBodies[2], "messages.1.content").Raw)
 	}
 	secondAssistant := gjson.GetBytes(requestBodies[2], "messages.3.content").Array()
@@ -1909,7 +1972,7 @@ func TestClaudeExecutorCompatThinkingReplayRetainsScopeAfterHistoryCompaction(t 
 
 		w.Header().Set("Content-Type", "application/json")
 		if call == 1 {
-			_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning","signature":"EgI="},{"type":"text","text":"compact answer"}],"stop_reason":"end_turn"}`))
+			_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning","signature":"` + strictValidClaudeThinkingSignature() + `"},{"type":"text","text":"compact answer"}],"stop_reason":"end_turn"}`))
 			return
 		}
 		_, _ = w.Write([]byte(`{"id":"msg-2","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}`))
@@ -1940,7 +2003,7 @@ func TestClaudeExecutorCompatThinkingReplayRetainsScopeAfterHistoryCompaction(t 
 		t.Fatalf("upstream request count = %d, want 2", len(requestBodies))
 	}
 	assistant := gjson.GetBytes(requestBodies[1], "messages.0.content").Array()
-	if assistant[0].Get("type").String() != "thinking" || assistant[0].Get("signature").String() != "" {
+	if assistant[0].Get("type").String() != "thinking" || assistant[0].Get("signature").String() != strictValidClaudeThinkingSignature() {
 		t.Fatalf("compacted request did not resolve the original replay scope: %s", gjson.GetBytes(requestBodies[1], "messages.0.content").Raw)
 	}
 }
@@ -1965,7 +2028,7 @@ func TestClaudeExecutorCompatThinkingReplayRetainsNoNonceScopeAfterHistoryCompac
 
 		w.Header().Set("Content-Type", "application/json")
 		if call == 1 {
-			_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning","signature":"EgI="},{"type":"text","text":"compact answer"}],"stop_reason":"end_turn"}`))
+			_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning","signature":"` + strictValidClaudeThinkingSignature() + `"},{"type":"text","text":"compact answer"}],"stop_reason":"end_turn"}`))
 			return
 		}
 		_, _ = w.Write([]byte(`{"id":"msg-2","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}`))
@@ -1993,7 +2056,7 @@ func TestClaudeExecutorCompatThinkingReplayRetainsNoNonceScopeAfterHistoryCompac
 		t.Fatalf("upstream request count = %d, want 2", len(requestBodies))
 	}
 	assistant := gjson.GetBytes(requestBodies[1], "messages.0.content").Array()
-	if assistant[0].Get("type").String() != "thinking" || assistant[0].Get("signature").String() != "" {
+	if assistant[0].Get("type").String() != "thinking" || assistant[0].Get("signature").String() != strictValidClaudeThinkingSignature() {
 		t.Fatalf("compacted request did not resolve the no-nonce replay scope: %s", gjson.GetBytes(requestBodies[1], "messages.0.content").Raw)
 	}
 }
@@ -2015,8 +2078,8 @@ func TestCacheClaudeThinkingReplayContent_DoesNotRegisterAliasOnFailedCacheWrite
 		firstUserHash = "first"
 	)
 
-	content1 := []byte(`[{"type":"thinking","thinking":"r1","signature":"EgI="},{"type":"text","text":"answer one"}]`)
-	content2 := []byte(`[{"type":"thinking","thinking":"r2","signature":"EgI="},{"type":"text","text":"answer two"}]`)
+	content1 := []byte(`[{"type":"thinking","thinking":"r1","signature":"` + strictValidClaudeThinkingSignature() + `"},{"type":"text","text":"answer one"}]`)
+	content2 := []byte(`[{"type":"thinking","thinking":"r2","signature":"` + strictValidClaudeThinkingSignature() + `"},{"type":"text","text":"answer two"}]`)
 	hash1 := helps.ClaudeThinkingReplayAssistantMessageHash(modelFamily, callerHash, content1)
 	hash2 := helps.ClaudeThinkingReplayAssistantMessageHash(modelFamily, callerHash, content2)
 
@@ -2058,7 +2121,7 @@ func TestCacheClaudeThinkingReplayContent_DoesNotRegisterAliasOnFailedCacheWrite
 		t.Fatalf("fresh cache read: %v", errGet2)
 	}
 	scope.snapshot = snapshot2
-	content3 := []byte(`[{"type":"thinking","thinking":"r3","signature":"EgI="},{"type":"text","text":"answer three"}]`)
+	content3 := []byte(`[{"type":"thinking","thinking":"r3","signature":"` + strictValidClaudeThinkingSignature() + `"},{"type":"text","text":"answer three"}]`)
 	hash3 := helps.ClaudeThinkingReplayAssistantMessageHash(modelFamily, callerHash, content3)
 	cacheClaudeThinkingReplayContent(ctx, scope, content3)
 	if resolved, ok := internalcache.ResolveClaudeThinkingReplaySessionKey(ctx, modelFamily, []internalcache.ClaudeThinkingReplayAliasMessage{{Hash: hash3, Weight: 1}}, firstUserHash); !ok || resolved != sessionKey {
@@ -2069,8 +2132,7 @@ func TestCacheClaudeThinkingReplayContent_DoesNotRegisterAliasOnFailedCacheWrite
 func TestClaudeExecutorCompatThinkingReplayCrossFormatStream(t *testing.T) {
 	internalcacheClearClaudeThinkingReplay(t)
 
-	opaque := bytes.Repeat([]byte{0x12, 0xff, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33}, 4)
-	opaqueSig := base64.StdEncoding.EncodeToString(opaque)
+	sig := strictValidClaudeThinkingSignature()
 
 	streamResponse := strings.Join([]string{
 		`event: message_start`,
@@ -2080,7 +2142,7 @@ func TestClaudeExecutorCompatThinkingReplayCrossFormatStream(t *testing.T) {
 		`event: content_block_delta`,
 		`data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"provider reasoning"}}`,
 		`event: content_block_delta`,
-		`data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"` + opaqueSig + `"}}`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"` + sig + `"}}`,
 		`event: content_block_stop`,
 		`data: {"type":"content_block_stop","index":0}`,
 		`event: content_block_start`,
@@ -2158,7 +2220,7 @@ func TestClaudeExecutorCompatThinkingReplayCrossFormatStream(t *testing.T) {
 		t.Fatalf("upstream request count = %d, want 2", len(requestBodies))
 	}
 	assistant := gjson.GetBytes(requestBodies[1], "messages.0.content").Array()
-	if len(assistant) == 0 || assistant[0].Get("type").String() != "thinking" || assistant[0].Get("signature").String() != "" {
+	if len(assistant) == 0 || assistant[0].Get("type").String() != "thinking" || assistant[0].Get("signature").String() != sig {
 		t.Fatalf("cross-format stream did not replay signed thinking: %s", gjson.GetBytes(requestBodies[1], "messages.0.content").Raw)
 	}
 }

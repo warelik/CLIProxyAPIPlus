@@ -1,6 +1,7 @@
 package signature
 
 import (
+	"bytes"
 	"encoding/base64"
 	"strings"
 	"testing"
@@ -640,9 +641,11 @@ func TestCompatibleAntigravityClaudeThinkingSignature_RejectsClaudeCAIS(t *testi
 	}
 }
 
-// TestHasDecodableClaudeThinkingSignature_AcceptsCAISEnvelope is the replay-gate
-// contract: CAIS envelopes must be accepted through IsValidClaudeCAISSignature,
-// while classic E/R and garbage keep their existing answers.
+// TestHasDecodableClaudeThinkingSignature_AcceptsCAISEnvelope is the Base64Only
+// decode-level contract: CAIS envelopes must be accepted through
+// IsValidClaudeCAISSignature, while classic E/R and garbage keep their existing
+// answers. Replay-cache writes use IsReplayCacheEligibleClaudeThinkingSignature,
+// not this helper.
 func TestHasDecodableClaudeThinkingSignature_AcceptsCAISEnvelope(t *testing.T) {
 	eSig := testClaudeThinkingSignature()
 	if eSig == "" || eSig[0] != 'E' {
@@ -665,6 +668,7 @@ func TestHasDecodableClaudeThinkingSignature_AcceptsCAISEnvelope(t *testing.T) {
 		{"E-prefix classic", eSig, true},
 		{"R-prefix classic", rSig, true},
 		{"E-prefix with cache prefix", "modelGroup#" + eSig, true},
+		{"truncated EgI= fragment", "EgI=", true},
 		{"empty", "", false},
 		{"whitespace", "   ", false},
 		{"garbage", "not-a-signature", false},
@@ -677,6 +681,51 @@ func TestHasDecodableClaudeThinkingSignature_AcceptsCAISEnvelope(t *testing.T) {
 			got := HasDecodableClaudeThinkingSignature(tc.sig)
 			if got != tc.want {
 				t.Fatalf("HasDecodableClaudeThinkingSignature(%s) = %v, want %v", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestIsReplayCacheEligibleClaudeThinkingSignature is the cache-write
+// contract: a signature is stored if and only if it is a Strict-valid Claude
+// E/R tree (channel_id present) or a structurally valid CAIS envelope.
+func TestIsReplayCacheEligibleClaudeThinkingSignature(t *testing.T) {
+	eSig := testClaudeThinkingSignature()
+	if eSig == "" || eSig[0] != 'E' {
+		t.Fatalf("testClaudeThinkingSignature() = %q, want non-empty E-prefix", eSig)
+	}
+	rSig := base64.StdEncoding.EncodeToString([]byte(eSig))
+	if rSig == "" || rSig[0] != 'R' {
+		t.Fatalf("R-form of classic signature = %q, want R-prefix", rSig)
+	}
+	opaque := bytes.Repeat([]byte{0x12, 0xff, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33}, 4)
+	opaqueSig := base64.StdEncoding.EncodeToString(opaque)
+
+	cases := []struct {
+		name string
+		sig  string
+		want bool
+	}{
+		{"empty", "", false},
+		{"whitespace", "   ", false},
+		{"truncated EgI= fragment", "EgI=", false},
+		{"truncated EgM= fragment", "EgM=", false},
+		{"opaque E-prefix blob", opaqueSig, false},
+		{"garbage", "not-a-signature", false},
+		{"foreign GPT blob", "gAAAAABopenai-encrypted-content", false},
+		{"Strict-valid E", eSig, true},
+		{"Strict-valid R", rSig, true},
+		{"Strict-valid E with cache prefix", "modelGroup#" + eSig, true},
+		{"observed CAIS", observedFable5Sample, true},
+		{"CAIS with ccmax prefix", "ccmax#" + observedFable5Sample, true},
+		{"generated opus-5 CAIS", testClaudeCAISSignature("claude-opus-5"), true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := IsReplayCacheEligibleClaudeThinkingSignature(tc.sig)
+			if got != tc.want {
+				t.Fatalf("IsReplayCacheEligibleClaudeThinkingSignature(%s) = %v, want %v", tc.name, got, tc.want)
 			}
 		})
 	}

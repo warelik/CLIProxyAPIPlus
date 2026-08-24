@@ -535,10 +535,14 @@ func claudeThinkingReplayHashBytes(h hash.Hash, b []byte) {
 	h.Write(b)
 }
 
-// ClaudeThinkingReplayContentIsReplayable reports whether a content array
-// carries a decodable Claude thinking signature. Only provenanced signed turns
-// are cached; unsigned or malformed-signature responses must not evict earlier
-// replay state.
+// ClaudeThinkingReplayContentIsReplayable reports whether a content array may
+// be written to the Claude thinking replay cache.
+//
+// A turn is written if and only if it contains at least one thinking part
+// whose signature satisfies IsReplayCacheEligibleClaudeThinkingSignature.
+// The named base case is a content array with no such part (unsigned turns,
+// empty signatures, truncated fragments such as EgI=, opaque E-prefix blobs,
+// foreign envelopes): those must not evict earlier replay state.
 func ClaudeThinkingReplayContentIsReplayable(content []byte) bool {
 	root := gjson.ParseBytes(content)
 	if !root.IsArray() {
@@ -548,7 +552,7 @@ func ClaudeThinkingReplayContentIsReplayable(content []byte) bool {
 		if strings.TrimSpace(part.Get("type").String()) != "thinking" {
 			continue
 		}
-		if signature.HasDecodableClaudeThinkingSignature(part.Get("signature").String()) {
+		if signature.IsReplayCacheEligibleClaudeThinkingSignature(part.Get("signature").String()) {
 			return true
 		}
 	}

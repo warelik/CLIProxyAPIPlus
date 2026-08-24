@@ -143,11 +143,6 @@ func cacheClaudeThinkingReplayResponse(ctx context.Context, scope claudeThinking
 	}
 }
 
-// claudeThinkingReplayContentIsReplayable reports whether a content array
-// carries a decodable Claude thinking signature. Only provenanced signed turns
-// are cached; unsigned or malformed-signature responses must not evict earlier
-// replay state.
-
 func cacheClaudeThinkingReplayContent(ctx context.Context, scope claudeThinkingReplayScope, content []byte) {
 	if !scope.valid() || !scope.cacheReady {
 		return

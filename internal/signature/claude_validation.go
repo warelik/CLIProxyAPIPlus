@@ -175,9 +175,35 @@ func IsValidClaudeThinkingSignature(rawSignature string, opts ...ClaudeSignature
 	return err == nil
 }
 
+// IsReplayCacheEligibleClaudeThinkingSignature reports whether rawSignature is
+// accepted into the Claude thinking replay cache.
+//
+// A signature is accepted into the cache if and only if it is either:
+//
+//   - a Strict-valid Claude thinking envelope: single-layer E or double-layer R
+//     whose decoded protobuf tree includes a top-level field-2 (bytes) container
+//     holding a channel block with channel_id (field 2.1.1 varint), or
+//   - a structurally valid CAIS envelope: decoded payload starts with 0x08
+//     (top-level field 1 varint), nested container and channel block, non-empty
+//     signature bytes, and model_text prefixed "claude-".
+//
+// The named base case is empty or whitespace-only input, which is rejected.
+// The distinguishing field is the complete channel_id-bearing protobuf tree
+// (E/R) or the CAIS required-field set, not base64-decodability of an E/R
+// prefix. Truncated length-delimited fragments such as EgI= (tag field 2 /
+// wire type 2, claimed payload length 2, zero bytes remaining) are rejected.
+func IsReplayCacheEligibleClaudeThinkingSignature(rawSignature string) bool {
+	if IsValidClaudeCAISSignature(rawSignature) {
+		return true
+	}
+	return IsValidClaudeThinkingSignature(rawSignature, ClaudeSignatureValidationOptions{Strict: true})
+}
+
 // HasDecodableClaudeThinkingSignature reports whether rawSignature has the
 // Claude E/R shape and its expected base64 layer(s) can be decoded, or is a
-// valid Claude CAIS envelope.
+// valid Claude CAIS envelope. This is the Base64Only cleanup helper, not the
+// replay-cache write predicate; cache writes use
+// IsReplayCacheEligibleClaudeThinkingSignature.
 func HasDecodableClaudeThinkingSignature(rawSignature string) bool {
 	sig := stripClaudeSignaturePrefix(rawSignature)
 	if sig == "" || len(sig) > MaxClaudeThinkingSignatureLen {
