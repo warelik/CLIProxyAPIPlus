@@ -26,6 +26,8 @@ import (
 // sync.Map, because credits hint refreshes run on background goroutines that
 // may still be writing these maps when a test's cleanup runs. Replacing the
 // variable is an unsynchronized write and races with them; Clear is not.
+// cliproxyauth credits hints live in another package and are not cleared here;
+// tests that observe Home KV reads must overwrite the hint for their auth ID.
 func resetAntigravityCreditsRetryState() {
 	antigravityCreditsFailureByAuth.Clear()
 	antigravityShortCooldownByAuth.Clear()
@@ -584,8 +586,12 @@ func TestAntigravityAuthHasCredits(t *testing.T) {
 
 func TestAntigravityAuthHasCreditsRequiredHomeBalanceUsesKV(t *testing.T) {
 	resetAntigravityCreditsRetryState()
-	t.Cleanup(resetAntigravityCreditsRetryState)
 	const authID = "home-balance-auth"
+	cliproxyauth.SetAntigravityCreditsHint(authID, cliproxyauth.AntigravityCreditsHint{})
+	t.Cleanup(func() {
+		cliproxyauth.SetAntigravityCreditsHint(authID, cliproxyauth.AntigravityCreditsHint{})
+		resetAntigravityCreditsRetryState()
+	})
 	client := newFakeAntigravityKVClient()
 	client.values[antigravityCreditsBalanceKey(authID)] = mustAntigravityJSON(t, antigravityCreditsBalance{
 		CreditAmount:    10,

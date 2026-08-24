@@ -241,6 +241,9 @@ func TestXAIWebsocketsExecuteStreamSendsResponseCreateWithPreviousResponseID(t *
 	defer server.Close()
 
 	exec := NewXAIWebsocketsExecutor(&config.Config{})
+	exec.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
+	exec.idStore = &xaiWebsocketIDStateStore{sessions: make(map[string]*xaiWebsocketIDState)}
+	defer exec.CloseExecutionSession("execution-session-1")
 	auth := &cliproxyauth.Auth{
 		ID:       "xai-auth",
 		Provider: "xai",
@@ -261,7 +264,8 @@ func TestXAIWebsocketsExecuteStreamSendsResponseCreateWithPreviousResponseID(t *
 			cliproxyexecutor.ExecutionSessionMetadataKey: "execution-session-1",
 		},
 	}
-	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
+	ctx, cancel := context.WithCancel(cliproxyexecutor.WithDownstreamWebsocket(context.Background()))
+	defer cancel()
 
 	result, err := exec.ExecuteStream(ctx, auth, req, opts)
 	if err != nil {
@@ -305,6 +309,9 @@ func TestXAIWebsocketsExecuteStreamSendsResponseCreateWithPreviousResponseID(t *
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for completed chunk")
+	}
+	cancel()
+	for range result.Chunks {
 	}
 }
 
