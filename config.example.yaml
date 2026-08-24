@@ -182,7 +182,7 @@ transient-error-cooldown-seconds: 0
 
 # Minimum base in seconds for the quota cooldown ladder.
 # Sub-second Retry-After hints are never allowed below this floor. Default 1.
-# Stacks on PR #198 (fix/quota-backoff-hint-floor) / router-for-me/CLIProxyAPI#5130.
+# Values above 1800 (30 minutes) are clamped to 1800 because the ladder is capped at 30 minutes.
 quota-cooldown-floor-seconds: 1
 
 # When true, globally disable Claude request cloaking (the Claude Code CLI disguise and
