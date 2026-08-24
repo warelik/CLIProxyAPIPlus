@@ -124,3 +124,21 @@ func TestSanitizeClaudeMessagesForClaudeUpstreamStripsOpaqueThinkingSignatureInC
 		t.Fatalf("compat sanitizer did not retain empty signature member on opaque-signature block: %s", withCompat)
 	}
 }
+
+func TestSanitizeClaudeMessagesForClaudeUpstreamPreservesValidClaudeSignatureInCompatMode(t *testing.T) {
+	sig := testClaudeThinkingSignature()
+	input := []byte(`{"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"reason","signature":"` + sig + `"}]}]}`)
+
+	withCompat, _ := SanitizeClaudeMessagesForClaudeUpstream(input, "claude-sonnet-4", true)
+	part := gjson.GetBytes(withCompat, "messages.0.content.0")
+	if part.Get("type").String() != "thinking" {
+		t.Fatalf("compat sanitizer dropped a valid Claude thinking block: %s", withCompat)
+	}
+	got := part.Get("signature").String()
+	if got == "" {
+		t.Fatalf("compat sanitizer stripped a valid Claude signature")
+	}
+	if part.Get("_cliproxy_replay_provenance").Exists() {
+		t.Fatalf("compat sanitizer leaked a provenance marker: %s", withCompat)
+	}
+}

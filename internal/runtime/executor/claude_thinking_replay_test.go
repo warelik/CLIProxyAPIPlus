@@ -20,6 +20,7 @@ import (
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
+	"google.golang.org/protobuf/encoding/protowire"
 )
 
 // claudeReplayPayloadWithConversationID adds a conversation nonce to a payload
@@ -368,6 +369,34 @@ func TestClaudeThinkingReplayCallerHash_IgnoresWhitespaceOnlyHeaders(t *testing.
 	}
 }
 
+// strictValidClaudeThinkingSignature builds a single-layer E envelope that
+// Strict Claude validation accepts. InspectClaudeSignaturePayload requires:
+// decoded[0]==0x12, top-level field 2 (bytes) holding a channel block with
+// required channel_id (field 1 varint 12), infra (field 2 varint 2), and
+// model_text (field 6, "claude-sonnet-4-6"). EgI= is not this: it is a
+// truncated length-delimited tag (field 2 / wire 2, claimed length 2, zero
+// payload bytes) and Strict rejects it.
+func strictValidClaudeThinkingSignature() string {
+	channelBlock := []byte{}
+	channelBlock = protowire.AppendTag(channelBlock, 1, protowire.VarintType)
+	channelBlock = protowire.AppendVarint(channelBlock, 12)
+	channelBlock = protowire.AppendTag(channelBlock, 2, protowire.VarintType)
+	channelBlock = protowire.AppendVarint(channelBlock, 2)
+	channelBlock = protowire.AppendTag(channelBlock, 6, protowire.BytesType)
+	channelBlock = protowire.AppendString(channelBlock, "claude-sonnet-4-6")
+
+	container := []byte{}
+	container = protowire.AppendTag(container, 1, protowire.BytesType)
+	container = protowire.AppendBytes(container, channelBlock)
+
+	payload := []byte{}
+	payload = protowire.AppendTag(payload, 2, protowire.BytesType)
+	payload = protowire.AppendBytes(payload, container)
+	payload = protowire.AppendTag(payload, 3, protowire.VarintType)
+	payload = protowire.AppendVarint(payload, 1)
+	return base64.StdEncoding.EncodeToString(payload)
+}
+
 func claudeReplayTestAuth(baseURL string) *cliproxyauth.Auth {
 	return &cliproxyauth.Auth{
 		ID:       "claude-replay-auth",
@@ -521,8 +550,10 @@ func TestClaudeExecutorCompatThinkingReplayRestoresOmittedBlock(t *testing.T) {
 	if got := content[0].Get("type").String(); got != "thinking" {
 		t.Fatalf("restored first content type = %q, want thinking", got)
 	}
-	if got := content[0].Get("signature").String(); got != "EgI=" {
-		t.Fatalf("restored signature = %q, want EgI=", got)
+	// Cache-born EgI= is not a Claude envelope. Restore the omitted block;
+	// sanitizer must clear the signature before the compat upstream sees it.
+	if got := content[0].Get("signature").String(); got != "" {
+		t.Fatalf("restored signature = %q, want empty", got)
 	}
 }
 
@@ -589,12 +620,144 @@ func TestClaudeExecutorCompatThinkingReplayRestoresOmittedBlockInStream(t *testi
 	if len(content) != 2 || content[0].Get("type").String() != "thinking" {
 		t.Fatalf("second streamed assistant content = %s, want restored thinking and tool_use", gjson.GetBytes(requestBodies[1], "messages.1.content").Raw)
 	}
-	if got := content[0].Get("signature").String(); got != "EgI=" {
-		t.Fatalf("restored streamed signature = %q, want EgI=", got)
+	if got := content[0].Get("signature").String(); got != "" {
+		t.Fatalf("restored streamed signature = %q, want empty", got)
+	}
+}
+
+func TestClaudeExecutorCompatThinkingReplayPreservesValidClaudeSignature(t *testing.T) {
+	internalcacheClearClaudeThinkingReplay(t)
+	sig := strictValidClaudeThinkingSignature()
+
+	var mu sync.Mutex
+	var requestBodies [][]byte
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, errRead := io.ReadAll(r.Body)
+		if errRead != nil {
+			t.Errorf("read request body: %v", errRead)
+			return
+		}
+		mu.Lock()
+		requestBodies = append(requestBodies, bytes.Clone(body))
+		callCount++
+		call := callCount
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		if call == 1 {
+			_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning","signature":"` + sig + `"},{"type":"tool_use","id":"toolu_1","name":"Read","input":{"path":"README.md"}}],"stop_reason":"tool_use"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"msg-2","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"}`))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(nil)
+	auth := claudeReplayTestAuth(server.URL)
+	firstPayload := []byte(`{"messages":[{"role":"user","content":"inspect"}]}`)
+	firstRequest, firstOptions := claudeReplayTestRequest(firstPayload, "valid-sig-replay", true, sdktranslator.FormatClaude)
+	if _, errExecute := executor.Execute(context.Background(), auth, firstRequest, firstOptions); errExecute != nil {
+		t.Fatalf("first Execute() error = %v", errExecute)
+	}
+
+	secondPayload := []byte(`{"messages":[{"role":"user","content":"inspect"},{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"path":"README.md"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}]}`)
+	secondRequest, secondOptions := claudeReplayTestRequest(secondPayload, "valid-sig-replay", true, sdktranslator.FormatClaude)
+	if _, errExecute := executor.Execute(context.Background(), auth, secondRequest, secondOptions); errExecute != nil {
+		t.Fatalf("second Execute() error = %v", errExecute)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(requestBodies) != 2 {
+		t.Fatalf("upstream request count = %d, want 2", len(requestBodies))
+	}
+	content := gjson.GetBytes(requestBodies[1], "messages.1.content").Array()
+	if len(content) != 2 {
+		t.Fatalf("second assistant content = %s, want thinking and tool_use", gjson.GetBytes(requestBodies[1], "messages.1.content").Raw)
+	}
+	if got := content[0].Get("type").String(); got != "thinking" {
+		t.Fatalf("restored first content type = %q, want thinking", got)
+	}
+	if got := content[0].Get("signature").String(); got != sig {
+		t.Fatalf("restored signature = %q, want Strict-valid Claude envelope", got)
+	}
+}
+
+func TestClaudeExecutorCompatThinkingReplayPreservesValidClaudeSignatureInStream(t *testing.T) {
+	internalcacheClearClaudeThinkingReplay(t)
+	sig := strictValidClaudeThinkingSignature()
+
+	var mu sync.Mutex
+	var requestBodies [][]byte
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, errRead := io.ReadAll(r.Body)
+		if errRead != nil {
+			t.Errorf("read request body: %v", errRead)
+			return
+		}
+		mu.Lock()
+		requestBodies = append(requestBodies, bytes.Clone(body))
+		callCount++
+		call := callCount
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		if call == 1 {
+			_, _ = w.Write([]byte(claudeReplayThinkingStreamWithSignature(sig)))
+			return
+		}
+		_, _ = w.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-2\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n\n" +
+			"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(nil)
+	auth := claudeReplayTestAuth(server.URL)
+	firstPayload := []byte(`{"messages":[{"role":"user","content":"inspect"}]}`)
+	firstRequest, firstOptions := claudeReplayTestRequest(firstPayload, "valid-sig-stream-replay", true, sdktranslator.FormatClaude)
+	firstResult, errExecute := executor.ExecuteStream(context.Background(), auth, firstRequest, firstOptions)
+	if errExecute != nil {
+		t.Fatalf("first ExecuteStream() error = %v", errExecute)
+	}
+	for chunk := range firstResult.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("first stream error: %v", chunk.Err)
+		}
+	}
+
+	secondPayload := []byte(`{"messages":[{"role":"user","content":"inspect"},{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"path":"README.md"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}]}`)
+	secondRequest, secondOptions := claudeReplayTestRequest(secondPayload, "valid-sig-stream-replay", true, sdktranslator.FormatClaude)
+	secondResult, errExecute := executor.ExecuteStream(context.Background(), auth, secondRequest, secondOptions)
+	if errExecute != nil {
+		t.Fatalf("second ExecuteStream() error = %v", errExecute)
+	}
+	for chunk := range secondResult.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("second stream error: %v", chunk.Err)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(requestBodies) != 2 {
+		t.Fatalf("upstream request count = %d, want 2", len(requestBodies))
+	}
+	content := gjson.GetBytes(requestBodies[1], "messages.1.content").Array()
+	if len(content) != 2 || content[0].Get("type").String() != "thinking" {
+		t.Fatalf("second streamed assistant content = %s, want restored thinking and tool_use", gjson.GetBytes(requestBodies[1], "messages.1.content").Raw)
+	}
+	if got := content[0].Get("signature").String(); got != sig {
+		t.Fatalf("restored streamed signature = %q, want Strict-valid Claude envelope", got)
 	}
 }
 
 func claudeReplayThinkingStream() string {
+	return claudeReplayThinkingStreamWithSignature("EgI=")
+}
+
+func claudeReplayThinkingStreamWithSignature(sig string) string {
 	return "event: message_start\n" +
 		"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n\n" +
 		"event: content_block_start\n" +
@@ -602,7 +765,7 @@ func claudeReplayThinkingStream() string {
 		"event: content_block_delta\n" +
 		"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"provider reasoning\"}}\n\n" +
 		"event: content_block_delta\n" +
-		"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"EgI=\"}}\n\n" +
+		"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"" + sig + "\"}}\n\n" +
 		"event: content_block_stop\n" +
 		"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
 		"event: content_block_start\n" +
@@ -675,8 +838,8 @@ func TestClaudeExecutorCompatThinkingReplayRestoresBeforeMCPToolNameRemap(t *tes
 	if got := secondContent[0].Get("type").String(); got != "thinking" {
 		t.Fatalf("restored first content type = %q, want thinking", got)
 	}
-	if got := secondContent[0].Get("signature").String(); got != "EgI=" {
-		t.Fatalf("restored signature = %q, want EgI=", got)
+	if got := secondContent[0].Get("signature").String(); got != "" {
+		t.Fatalf("restored signature = %q, want empty", got)
 	}
 
 	// The restored tool_use name must be remapped for upstream, matching the
@@ -748,8 +911,8 @@ func TestClaudeExecutorCompatThinkingReplayRestoresOmittedThinkingWithToolProven
 	if got := content[0].Get("type").String(); got != "thinking" {
 		t.Fatalf("restored first content type = %q, want thinking", got)
 	}
-	if got := content[0].Get("signature").String(); got != "EgI=" {
-		t.Fatalf("restored signature = %q, want EgI=", got)
+	if got := content[0].Get("signature").String(); got != "" {
+		t.Fatalf("restored signature = %q, want empty", got)
 	}
 	if got := content[1].Get("signature").String(); got != "" {
 		t.Fatalf("restored tool_use still carried a signature: %q", got)
@@ -849,11 +1012,11 @@ func TestClaudeExecutorCompatThinkingReplayRestoresMultipleOmittedBlocks(t *test
 	}
 	firstContent := gjson.GetBytes(requestBodies[2], "messages.1.content").Array()
 	secondContent := gjson.GetBytes(requestBodies[2], "messages.3.content").Array()
-	if len(firstContent) != 2 || firstContent[0].Get("type").String() != "thinking" || firstContent[0].Get("signature").String() != "EgI=" {
-		t.Fatalf("first omitted turn was not restored: %s", gjson.GetBytes(requestBodies[2], "messages.1.content").Raw)
+	if len(firstContent) != 2 || firstContent[0].Get("type").String() != "thinking" || firstContent[0].Get("signature").String() != "" {
+		t.Fatalf("first omitted turn was not restored with empty signature: %s", gjson.GetBytes(requestBodies[2], "messages.1.content").Raw)
 	}
-	if len(secondContent) != 2 || secondContent[0].Get("type").String() != "thinking" || secondContent[0].Get("signature").String() != "EgM=" {
-		t.Fatalf("second omitted turn was not restored: %s", gjson.GetBytes(requestBodies[2], "messages.3.content").Raw)
+	if len(secondContent) != 2 || secondContent[0].Get("type").String() != "thinking" || secondContent[0].Get("signature").String() != "" {
+		t.Fatalf("second omitted turn was not restored with empty signature: %s", gjson.GetBytes(requestBodies[2], "messages.3.content").Raw)
 	}
 }
 
@@ -913,8 +1076,8 @@ func TestClaudeExecutorCompatThinkingReplayRestoresOpaqueOmittedBlock(t *testing
 	if got := content[0].Get("type").String(); got != "thinking" {
 		t.Fatalf("restored first content type = %q, want thinking", got)
 	}
-	if got := content[0].Get("signature").String(); got != opaqueSig {
-		t.Fatalf("restored opaque signature = %q, want %q", got, opaqueSig)
+	if got := content[0].Get("signature").String(); got != "" {
+		t.Fatalf("restored opaque signature = %q, want empty", got)
 	}
 }
 
@@ -957,8 +1120,8 @@ func TestClaudeExecutorCompatThinkingReplayRestoresEchoedSignedThinking(t *testi
 	}
 
 	// Client echoes the complete assistant content, including the signed thinking
-	// block. The sanitizer will clear the opaque signature; the replay cache must
-	// restore the original signed content.
+	// block. Restore may overlay the cache; sanitizer then clears the opaque
+	// signature before the compat upstream sees it.
 	secondPayload := []byte(`{"messages":[{"role":"user","content":"inspect"},{"role":"assistant","content":[{"type":"thinking","thinking":"provider reasoning","signature":"` + opaqueSig + `"},{"type":"tool_use","id":"toolu_1","name":"Read","input":{"path":"README.md"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}]}`)
 	secondRequest, secondOptions := claudeReplayTestRequest(secondPayload, "echoed-replay", true, sdktranslator.FormatClaude)
 	if _, errExecute := executor.Execute(context.Background(), auth, secondRequest, secondOptions); errExecute != nil {
@@ -977,8 +1140,8 @@ func TestClaudeExecutorCompatThinkingReplayRestoresEchoedSignedThinking(t *testi
 	if got := content[0].Get("type").String(); got != "thinking" {
 		t.Fatalf("restored first content type = %q, want thinking", got)
 	}
-	if got := content[0].Get("signature").String(); got != opaqueSig {
-		t.Fatalf("restored opaque signature = %q, want %q", got, opaqueSig)
+	if got := content[0].Get("signature").String(); got != "" {
+		t.Fatalf("restored opaque signature = %q, want empty", got)
 	}
 }
 
@@ -1040,8 +1203,8 @@ func TestClaudeExecutorCompatThinkingReplayRestoresSessionlessSameUpstreamSignat
 	if got := content[0].Get("type").String(); got != "thinking" {
 		t.Fatalf("restored first content type = %q, want thinking", got)
 	}
-	if got := content[0].Get("signature").String(); got != opaqueSig {
-		t.Fatalf("sessionless restored signature = %q, want %q", got, opaqueSig)
+	if got := content[0].Get("signature").String(); got != "" {
+		t.Fatalf("sessionless restored signature = %q, want empty", got)
 	}
 }
 
@@ -1129,13 +1292,19 @@ func TestClaudeExecutorCompatThinkingReplayIsConversationScopedForSessionlessCli
 	}
 
 	aContent := gjson.GetBytes(requestBodies[2], "messages.1.content").Array()
-	if aContent[0].Get("signature").String() != opaqueSigA {
-		t.Fatalf("conversation A did not restore its own signature: %s", aContent[0].Get("signature").String())
+	if aContent[0].Get("type").String() != "thinking" || aContent[0].Get("thinking").String() != "provider reasoning A" {
+		t.Fatalf("conversation A did not restore its own thinking: %s", gjson.GetBytes(requestBodies[2], "messages.1.content").Raw)
+	}
+	if aContent[0].Get("signature").String() != "" {
+		t.Fatalf("conversation A restored signature = %q, want empty", aContent[0].Get("signature").String())
 	}
 
 	bContent := gjson.GetBytes(requestBodies[3], "messages.1.content").Array()
-	if bContent[0].Get("signature").String() != opaqueSigB {
-		t.Fatalf("conversation B did not restore its own signature: %s", bContent[0].Get("signature").String())
+	if bContent[0].Get("type").String() != "thinking" || bContent[0].Get("thinking").String() != "provider reasoning B" {
+		t.Fatalf("conversation B did not restore its own thinking: %s", gjson.GetBytes(requestBodies[3], "messages.1.content").Raw)
+	}
+	if bContent[0].Get("signature").String() != "" {
+		t.Fatalf("conversation B restored signature = %q, want empty", bContent[0].Get("signature").String())
 	}
 
 	leakContent := gjson.GetBytes(requestBodies[4], "messages.1.content").Array()
@@ -1169,11 +1338,11 @@ func TestClaudeExecutorCompatThinkingReplayIsCallerScopedForSessionlessClients(t
 
 		w.Header().Set("Content-Type", "application/json")
 		if call == 1 {
-			_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning","signature":"` + opaqueSigA + `"},{"type":"tool_use","id":"toolu_1","name":"Read","input":{"path":"one"}}],"stop_reason":"tool_use"}`))
+			_, _ = w.Write([]byte(`{"id":"msg-1","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning A","signature":"` + opaqueSigA + `"},{"type":"tool_use","id":"toolu_1","name":"Read","input":{"path":"one"}}],"stop_reason":"tool_use"}`))
 			return
 		}
 		if call == 2 {
-			_, _ = w.Write([]byte(`{"id":"msg-2","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning","signature":"` + opaqueSigB + `"},{"type":"tool_use","id":"toolu_1","name":"Read","input":{"path":"one"}}],"stop_reason":"tool_use"}`))
+			_, _ = w.Write([]byte(`{"id":"msg-2","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"thinking","thinking":"provider reasoning B","signature":"` + opaqueSigB + `"},{"type":"tool_use","id":"toolu_1","name":"Read","input":{"path":"one"}}],"stop_reason":"tool_use"}`))
 			return
 		}
 		_, _ = w.Write([]byte(`{"id":"msg-3","type":"message","role":"assistant","model":"claude-synthetic-4772","content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"}`))
@@ -1224,13 +1393,19 @@ func TestClaudeExecutorCompatThinkingReplayIsCallerScopedForSessionlessClients(t
 	}
 
 	aContent := gjson.GetBytes(requestBodies[2], "messages.1.content").Array()
-	if aContent[0].Get("signature").String() != opaqueSigA {
-		t.Fatalf("caller A did not restore its own signature: %s", aContent[0].Get("signature").String())
+	if aContent[0].Get("type").String() != "thinking" || aContent[0].Get("thinking").String() != "provider reasoning A" {
+		t.Fatalf("caller A did not restore its own thinking: %s", gjson.GetBytes(requestBodies[2], "messages.1.content").Raw)
+	}
+	if aContent[0].Get("signature").String() != "" {
+		t.Fatalf("caller A restored signature = %q, want empty", aContent[0].Get("signature").String())
 	}
 
 	bContent := gjson.GetBytes(requestBodies[3], "messages.1.content").Array()
-	if bContent[0].Get("signature").String() != opaqueSigB {
-		t.Fatalf("caller B did not restore its own signature or leaked caller A's: %s", bContent[0].Get("signature").String())
+	if bContent[0].Get("type").String() != "thinking" || bContent[0].Get("thinking").String() != "provider reasoning B" {
+		t.Fatalf("caller B did not restore its own thinking or leaked caller A's: %s", gjson.GetBytes(requestBodies[3], "messages.1.content").Raw)
+	}
+	if bContent[0].Get("signature").String() != "" {
+		t.Fatalf("caller B restored signature = %q, want empty", bContent[0].Get("signature").String())
 	}
 }
 
@@ -1310,13 +1485,19 @@ func TestClaudeExecutorCompatThinkingReplayIdenticalOpeningsUseConversationNonce
 	}
 
 	aContent := gjson.GetBytes(requestBodies[2], "messages.1.content").Array()
-	if aContent[0].Get("signature").String() != opaqueSigA {
-		t.Fatalf("conversation A did not restore its own signature: %s", aContent[0].Get("signature").String())
+	if aContent[0].Get("type").String() != "thinking" || aContent[0].Get("thinking").String() != "provider reasoning A" {
+		t.Fatalf("conversation A did not restore its own thinking: %s", gjson.GetBytes(requestBodies[2], "messages.1.content").Raw)
+	}
+	if aContent[0].Get("signature").String() != "" {
+		t.Fatalf("conversation A restored signature = %q, want empty", aContent[0].Get("signature").String())
 	}
 
 	bContent := gjson.GetBytes(requestBodies[3], "messages.1.content").Array()
-	if bContent[0].Get("signature").String() != opaqueSigB {
-		t.Fatalf("conversation B did not restore its own signature or leaked A's: %s", bContent[0].Get("signature").String())
+	if bContent[0].Get("type").String() != "thinking" || bContent[0].Get("thinking").String() != "provider reasoning B" {
+		t.Fatalf("conversation B did not restore its own thinking or leaked A's: %s", gjson.GetBytes(requestBodies[3], "messages.1.content").Raw)
+	}
+	if bContent[0].Get("signature").String() != "" {
+		t.Fatalf("conversation B restored signature = %q, want empty", bContent[0].Get("signature").String())
 	}
 }
 
@@ -1374,8 +1555,8 @@ func TestClaudeExecutorCompatThinkingReplayRestoresSignedNonToolResponse(t *test
 	if len(content) != 2 || content[0].Get("type").String() != "thinking" {
 		t.Fatalf("second assistant content = %s, want restored thinking and text", gjson.GetBytes(requestBodies[1], "messages.1.content").Raw)
 	}
-	if got := content[0].Get("signature").String(); got != "EgI=" {
-		t.Fatalf("restored signature = %q, want EgI=", got)
+	if got := content[0].Get("signature").String(); got != "" {
+		t.Fatalf("restored signature = %q, want empty", got)
 	}
 }
 
@@ -1433,8 +1614,8 @@ func TestClaudeExecutorCompatThinkingReplayRestoresAfterSensitiveWordObfuscation
 	if len(content) != 2 || content[0].Get("type").String() != "thinking" {
 		t.Fatalf("second assistant content = %s, want restored thinking and text", gjson.GetBytes(requestBodies[1], "messages.1.content").Raw)
 	}
-	if got := content[0].Get("signature").String(); got != "EgI=" {
-		t.Fatalf("restored signature = %q, want EgI=", got)
+	if got := content[0].Get("signature").String(); got != "" {
+		t.Fatalf("restored signature = %q, want empty", got)
 	}
 	text := content[1].Get("text").String()
 	if text == "the secret answer" {
@@ -1495,8 +1676,8 @@ func TestClaudeExecutorCompatThinkingReplaySkipsObfuscationWhenCloakingDisabled(
 	if len(content) != 2 || content[0].Get("type").String() != "thinking" {
 		t.Fatalf("second assistant content = %s, want restored thinking and text", gjson.GetBytes(requestBodies[1], "messages.1.content").Raw)
 	}
-	if got := content[0].Get("signature").String(); got != "EgI=" {
-		t.Fatalf("restored signature = %q, want EgI=", got)
+	if got := content[0].Get("signature").String(); got != "" {
+		t.Fatalf("restored signature = %q, want empty", got)
 	}
 	text := content[1].Get("text").String()
 	if text != "the secret answer" {
@@ -1585,7 +1766,7 @@ func TestClaudeExecutorCompatThinkingReplayRetainsSignedTurnAfterUnsignedRespons
 		t.Fatalf("upstream request count = %d, want 3", len(requestBodies))
 	}
 	firstAssistant := gjson.GetBytes(requestBodies[2], "messages.1.content").Array()
-	if firstAssistant[0].Get("signature").String() != "EgI=" {
+	if firstAssistant[0].Get("type").String() != "thinking" || firstAssistant[0].Get("signature").String() != "" {
 		t.Fatalf("first signed turn not replayed after unsigned response: %s", gjson.GetBytes(requestBodies[2], "messages.1.content").Raw)
 	}
 	secondAssistant := gjson.GetBytes(requestBodies[2], "messages.3.content").Array()
@@ -1759,7 +1940,7 @@ func TestClaudeExecutorCompatThinkingReplayRetainsScopeAfterHistoryCompaction(t 
 		t.Fatalf("upstream request count = %d, want 2", len(requestBodies))
 	}
 	assistant := gjson.GetBytes(requestBodies[1], "messages.0.content").Array()
-	if assistant[0].Get("signature").String() != "EgI=" {
+	if assistant[0].Get("type").String() != "thinking" || assistant[0].Get("signature").String() != "" {
 		t.Fatalf("compacted request did not resolve the original replay scope: %s", gjson.GetBytes(requestBodies[1], "messages.0.content").Raw)
 	}
 }
@@ -1812,7 +1993,7 @@ func TestClaudeExecutorCompatThinkingReplayRetainsNoNonceScopeAfterHistoryCompac
 		t.Fatalf("upstream request count = %d, want 2", len(requestBodies))
 	}
 	assistant := gjson.GetBytes(requestBodies[1], "messages.0.content").Array()
-	if assistant[0].Get("signature").String() != "EgI=" {
+	if assistant[0].Get("type").String() != "thinking" || assistant[0].Get("signature").String() != "" {
 		t.Fatalf("compacted request did not resolve the no-nonce replay scope: %s", gjson.GetBytes(requestBodies[1], "messages.0.content").Raw)
 	}
 }
@@ -1977,7 +2158,7 @@ func TestClaudeExecutorCompatThinkingReplayCrossFormatStream(t *testing.T) {
 		t.Fatalf("upstream request count = %d, want 2", len(requestBodies))
 	}
 	assistant := gjson.GetBytes(requestBodies[1], "messages.0.content").Array()
-	if len(assistant) == 0 || assistant[0].Get("signature").String() != opaqueSig {
+	if len(assistant) == 0 || assistant[0].Get("type").String() != "thinking" || assistant[0].Get("signature").String() != "" {
 		t.Fatalf("cross-format stream did not replay signed thinking: %s", gjson.GetBytes(requestBodies[1], "messages.0.content").Raw)
 	}
 }

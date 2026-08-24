@@ -205,6 +205,11 @@ func ClaudeThinkingReplayContentsMatch(currentContent, cachedContent gjson.Resul
 	if !currentContent.IsArray() || !cachedContent.IsArray() {
 		return false
 	}
+	// Strip tool_use provenance on both sides so matching does not depend on
+	// whether the request-side sanitizer has already run. Restore is applied
+	// before sanitize; the cache is stored already-normalized.
+	currentContent = gjson.ParseBytes(ClaudeThinkingReplayNormalizeCachedContent([]byte(currentContent.Raw)))
+	cachedContent = gjson.ParseBytes(ClaudeThinkingReplayNormalizeCachedContent([]byte(cachedContent.Raw)))
 	if JSONEqual([]byte(currentContent.Raw), []byte(cachedContent.Raw)) {
 		return true
 	}

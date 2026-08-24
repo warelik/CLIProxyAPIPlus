@@ -86,9 +86,9 @@ func capClaudeThinkingReplayAliasMessages(hashes []internalcache.ClaudeThinkingR
 
 // prepareClaudeThinkingReplayRequest loads cached assistant content for this
 // request and strips any client-supplied _cliproxy_replay_provenance markers
-// from req.Payload. The actual restore is applied to bodyForUpstream after
-// signature sanitization and before MCP tool-name remapping, so cache-provenanced
-// signatures bypass the sanitizer while matching against the caller-facing body.
+// from req.Payload. The actual restore is applied to bodyForUpstream before
+// signature sanitization and before MCP tool-name remapping, so restored
+// signatures pass Detect/Decide like any other value on the outbound body.
 func prepareClaudeThinkingReplayRequest(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (claudeThinkingReplayScope, [][]byte, bool) {
 	scope := claudeThinkingReplayScopeFromRequest(ctx, auth, req, opts)
 	if !scope.valid() {
