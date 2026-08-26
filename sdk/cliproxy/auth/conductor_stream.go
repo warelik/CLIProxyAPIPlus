@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net/http"
@@ -12,6 +13,22 @@ import (
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
+
+func isStreamFrameLike(payload []byte) bool {
+	trimmed := bytes.TrimSpace(payload)
+	if len(trimmed) == 0 {
+		return false
+	}
+	if bytes.HasPrefix(trimmed, []byte("data:")) ||
+		bytes.HasPrefix(trimmed, []byte("event:")) ||
+		bytes.HasPrefix(trimmed, []byte("id:")) ||
+		bytes.HasPrefix(trimmed, []byte("retry:")) ||
+		bytes.HasPrefix(trimmed, []byte(":")) ||
+		bytes.Equal(trimmed, []byte("[DONE]")) {
+		return true
+	}
+	return trimmed[0] == '{' || trimmed[0] == '['
+}
 
 func newTTFTTimeoutError(timeout time.Duration) error {
 	return &Error{
@@ -53,14 +70,42 @@ func (m *Manager) streamFirstChunkTimeout(opts cliproxyexecutor.Options) time.Du
 	return 0
 }
 
-func discardStreamChunks(ch <-chan cliproxyexecutor.StreamChunk) {
+var streamDrainTimeout = 5 * time.Second
+
+func discardStreamChunks(ctx context.Context, ch <-chan cliproxyexecutor.StreamChunk) <-chan struct{} {
+	done := make(chan struct{})
 	if ch == nil {
-		return
+		close(done)
+		return done
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	go func() {
-		for range ch {
+		defer close(done)
+		timer := time.NewTimer(streamDrainTimeout)
+		defer timer.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
+				return
+			case _, ok := <-ch:
+				if !ok {
+					return
+				}
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(streamDrainTimeout)
+			}
 		}
 	}()
+	return done
 }
 
 type streamBootstrapError struct {
@@ -108,7 +153,7 @@ func (e *streamBootstrapError) Headers() http.Header {
 
 func streamErrorResult(headers http.Header, err error) *cliproxyexecutor.StreamResult {
 	ch := make(chan cliproxyexecutor.StreamChunk, 1)
-	ch <- cliproxyexecutor.StreamChunk{Err: err}
+	ch <- cliproxyexecutor.StreamChunk{Err: sanitizeErrorTextFields(err)}
 	close(ch)
 	return &cliproxyexecutor.StreamResult{
 		Headers: cloneHTTPHeader(headers),
@@ -185,22 +230,6 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 	}
 }
 
-// redactStreamErrorForLog returns a copy of err with the message replaced by a
-// static redaction string. In-band stream errors may carry arbitrary upstream
-// error bodies, including credentials or raw provider details, so the original
-// message must not reach logs.
-func redactStreamErrorForLog(err *Error) error {
-	if err == nil {
-		return nil
-	}
-	return &Error{
-		Code:       err.Code,
-		Message:    "[in-band stream error redacted]",
-		HTTPStatus: err.HTTPStatus,
-		Retryable:  err.Retryable,
-	}
-}
-
 func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, resultModel string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk, aliasResult OAuthModelAliasResult, ephemeralResult bool, opts cliproxyexecutor.Options, cleanups ...func()) *cliproxyexecutor.StreamResult {
 	out := make(chan cliproxyexecutor.StreamChunk)
 	streamStart := time.Now()
@@ -218,53 +247,13 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 		if aliasResult.ForceMapping && strings.TrimSpace(aliasResult.OriginalAlias) != "" {
 			rewriter = NewStreamRewriter(StreamRewriteOptions{RewriteModel: aliasResult.OriginalAlias})
 		}
-		emit := func(chunk cliproxyexecutor.StreamChunk) bool {
-			if chunk.Err != nil && !failed {
-				failed = true
-				entry := logEntryWithRequestID(ctx)
-				warnLogUpstreamFailure(ctx, entry, provider, resultModel, auth, time.Since(streamStart), chunk.Err)
-				rerr := resultErrorFromError(chunk.Err)
-				action, okAction := matchRequestScopedErrorAction(auth, chunk.Err, m.runtimeConfigSnapshot())
-				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr, Options: opts}
-				applyRequestScopedActionToResult(action, okAction, &result)
-				m.recordExecutionResult(ctx, result, auth, ephemeralResult)
-			}
-			if !failed && len(chunk.Payload) > 0 {
-				if streamErr := errorDetector.Observe(chunk.Payload); streamErr != nil {
-					failed = true
-					entry := logEntryWithRequestID(ctx)
-					warnLogUpstreamFailure(ctx, entry, provider, resultModel, auth, time.Since(streamStart), redactStreamErrorForLog(streamErr))
-					rerr := resultErrorFromError(streamErr)
-					action, okAction := matchRequestScopedErrorAction(auth, streamErr, m.runtimeConfigSnapshot())
-					result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr, Options: opts}
-					applyRequestScopedActionToResult(action, okAction, &result)
-					m.recordExecutionResult(ctx, result, auth, ephemeralResult)
-				}
-			}
+		var frameBuffer []cliproxyexecutor.StreamChunk
+		frameBytes := 0
+
+		sendChunk := func(chunk cliproxyexecutor.StreamChunk) bool {
 			if !forward {
 				return false
 			}
-			if chunk.Err != nil {
-				if ctx == nil {
-					out <- chunk
-					return true
-				}
-				select {
-				case <-ctx.Done():
-					forward = false
-					return false
-				case out <- chunk:
-					return true
-				}
-			}
-			if len(chunk.Payload) == 0 {
-				return true
-			}
-			payload := rewriteForceMappedStreamChunk(rewriter, chunk.Payload)
-			if len(payload) == 0 {
-				return true
-			}
-			chunk.Payload = payload
 			if ctx == nil {
 				out <- chunk
 				return true
@@ -277,15 +266,117 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 				return true
 			}
 		}
+
+		flushFrame := func(asError bool) bool {
+			if len(frameBuffer) == 0 {
+				return true
+			}
+			if asError {
+				joined := make([]byte, 0, frameBytes)
+				for _, c := range frameBuffer {
+					joined = append(joined, c.Payload...)
+				}
+				frameBuffer = nil
+				frameBytes = 0
+				return sendChunk(cliproxyexecutor.StreamChunk{Payload: redactStreamPayload(joined)})
+			}
+			for _, c := range frameBuffer {
+				payload := rewriteForceMappedStreamChunk(rewriter, c.Payload)
+				if len(payload) == 0 {
+					continue
+				}
+				c.Payload = payload
+				if !sendChunk(c) {
+					return false
+				}
+			}
+			frameBuffer = nil
+			frameBytes = 0
+			return true
+		}
+
+		handleInBandError := func(streamErr *Error) {
+			if failed {
+				return
+			}
+			failed = true
+			streamErr = sanitizeErrorTextFields(streamErr).(*Error)
+			entry := logEntryWithRequestID(ctx)
+			warnLogUpstreamFailure(ctx, entry, provider, resultModel, auth, time.Since(streamStart), streamErr)
+			rerr := resultErrorFromError(streamErr)
+			action, okAction := matchRequestScopedErrorAction(auth, streamErr, m.runtimeConfigSnapshot())
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr, Options: opts}
+			applyRequestScopedActionToResult(action, okAction, &result)
+			m.recordExecutionResult(ctx, result, auth, ephemeralResult)
+		}
+
+		emit := func(chunk cliproxyexecutor.StreamChunk) bool {
+			if chunk.Err != nil && !failed {
+				failed = true
+				chunk.Err = sanitizeErrorTextFields(chunk.Err)
+				entry := logEntryWithRequestID(ctx)
+				warnLogUpstreamFailure(ctx, entry, provider, resultModel, auth, time.Since(streamStart), chunk.Err)
+				rerr := resultErrorFromError(chunk.Err)
+				action, okAction := matchRequestScopedErrorAction(auth, chunk.Err, m.runtimeConfigSnapshot())
+				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr, Options: opts}
+				applyRequestScopedActionToResult(action, okAction, &result)
+				m.recordExecutionResult(ctx, result, auth, ephemeralResult)
+			}
+			if chunk.Err != nil {
+				if !flushFrame(true) {
+					return false
+				}
+				chunk.Payload = redactStreamPayload(chunk.Payload)
+				return sendChunk(chunk)
+			}
+			if len(chunk.Payload) == 0 {
+				return true
+			}
+			if !failed && !isStreamFrameLike(chunk.Payload) && !errorDetector.HasPending() {
+				payload := rewriteForceMappedStreamChunk(rewriter, chunk.Payload)
+				if len(payload) == 0 {
+					return true
+				}
+				return sendChunk(cliproxyexecutor.StreamChunk{Payload: payload})
+			}
+			if !failed {
+				_ = errorDetector.Observe(chunk.Payload)
+				frameBuffer = append(frameBuffer, chunk)
+				frameBytes += len(chunk.Payload)
+				for {
+					frameErr, ok := errorDetector.TakeFrame()
+					if !ok {
+						break
+					}
+					if frameErr != nil {
+						handleInBandError(frameErr)
+						if !flushFrame(true) {
+							return false
+						}
+					} else {
+						if !flushFrame(false) {
+							return false
+						}
+					}
+				}
+				return true
+			}
+			payload := rewriteForceMappedStreamChunk(rewriter, chunk.Payload)
+			if len(payload) == 0 {
+				return true
+			}
+			payload = redactStreamPayload(payload)
+			return sendChunk(cliproxyexecutor.StreamChunk{Payload: payload})
+		}
 		for _, chunk := range buffered {
 			if ok := emit(chunk); !ok {
-				discardStreamChunks(remaining)
+				discardStreamChunks(ctx, remaining)
 				return
 			}
 		}
 		for chunk := range remaining {
 			if ok := emit(chunk); !ok {
-				discardStreamChunks(remaining)
+				discardStreamChunks(ctx, remaining)
 				return
 			}
 		}
@@ -295,16 +386,17 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 				return
 			}
 		}
-		if !failed {
-			if streamErr := errorDetector.Finish(); streamErr != nil {
-				failed = true
-				entry := logEntryWithRequestID(ctx)
-				warnLogUpstreamFailure(ctx, entry, provider, resultModel, auth, time.Since(streamStart), redactStreamErrorForLog(streamErr))
-				rerr := resultErrorFromError(streamErr)
-				action, okAction := matchRequestScopedErrorAction(auth, streamErr, m.runtimeConfigSnapshot())
-				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr, Options: opts}
-				applyRequestScopedActionToResult(action, okAction, &result)
-				m.recordExecutionResult(ctx, result, auth, ephemeralResult)
+		_ = errorDetector.Finish()
+		for {
+			frameErr, ok := errorDetector.TakeFrame()
+			if !ok {
+				break
+			}
+			if frameErr != nil {
+				handleInBandError(frameErr)
+			}
+			if !flushFrame(frameErr != nil) {
+				return
 			}
 		}
 		if !failed && (ephemeralResult || claudeOAuthRequestCancellation(ctx, auth, nil) == nil) {
@@ -447,7 +539,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					didRefreshOnUnauthorized = true
 					restartAttempt()
 					if streamResult != nil {
-						discardStreamChunks(streamResult.Chunks)
+						discardStreamChunks(ctx, streamResult.Chunks)
 					}
 					startRetry := time.Now()
 					streamResult, errStream = executor.ExecuteStream(attemptCtx, auth, execReq, execOpts)
@@ -459,7 +551,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 							stopTTFT()
 							cancelAttempt()
 							if streamResult != nil {
-								discardStreamChunks(streamResult.Chunks)
+								discardStreamChunks(ctx, streamResult.Chunks)
 							}
 							return nil, errCtx
 						}
@@ -476,7 +568,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				stopTTFT()
 				cancelAttempt()
 				if streamResult != nil {
-					discardStreamChunks(streamResult.Chunks)
+					discardStreamChunks(ctx, streamResult.Chunks)
 				}
 				return nil, errCancel
 			}
@@ -486,9 +578,10 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			stopTTFT()
 			cancelAttempt()
 			if streamResult != nil {
-				discardStreamChunks(streamResult.Chunks)
+				discardStreamChunks(ctx, streamResult.Chunks)
 			}
 			errStream = checkTTFTErr(errStream)
+			errStream = sanitizeErrorTextFields(errStream)
 			rerr := resultErrorFromError(errStream)
 			action, okAction := matchRequestScopedErrorAction(auth, errStream, m.runtimeConfigSnapshot())
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr, Options: execOpts}
@@ -525,7 +618,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			if errCtx := ctx.Err(); errCtx != nil {
 				stopTTFT()
 				cancelAttempt()
-				discardStreamChunks(streamResult.Chunks)
+				discardStreamChunks(ctx, streamResult.Chunks)
 				return nil, errCtx
 			}
 			bootstrapErr = checkTTFTErr(bootstrapErr)
@@ -541,12 +634,12 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					}
 				}
 				if errRefresh != nil {
-					discardStreamChunks(streamResult.Chunks)
+					discardStreamChunks(ctx, streamResult.Chunks)
 					bootstrapErr = errRefresh
 					warnLogUpstreamFailure(ctx, entry, provider, execModel, auth, time.Since(startStream), bootstrapErr)
 					streamResult = &cliproxyexecutor.StreamResult{}
 				} else if okRefresh {
-					discardStreamChunks(streamResult.Chunks)
+					discardStreamChunks(ctx, streamResult.Chunks)
 					auth = refreshed
 					m.replaceHomeExecutionLifecycleAuth(execOpts.ExecutionLifecycle, auth)
 					publishSelectedAuthMetadata(execOpts.Metadata, auth)
@@ -559,7 +652,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					retryErr = checkTTFTErr(retryErr)
 					if retryErr != nil {
 						if retryStream != nil {
-							discardStreamChunks(retryStream.Chunks)
+							discardStreamChunks(ctx, retryStream.Chunks)
 						}
 						if errCtx := ctx.Err(); errCtx != nil {
 							stopTTFT()
@@ -588,7 +681,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			if errCancel := claudeOAuthRequestCancellation(ctx, auth, bootstrapErr); errCancel != nil {
 				stopTTFT()
 				cancelAttempt()
-				discardStreamChunks(streamResult.Chunks)
+				discardStreamChunks(ctx, streamResult.Chunks)
 				return nil, errCancel
 			}
 		}
@@ -596,6 +689,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			stopTTFT()
 			cancelAttempt()
 			bootstrapErr = checkTTFTErr(bootstrapErr)
+			bootstrapErr = sanitizeErrorTextFields(bootstrapErr)
 			action, okAction := matchRequestScopedErrorAction(auth, bootstrapErr, m.runtimeConfigSnapshot())
 			if okAction {
 				rerr := resultErrorFromError(bootstrapErr)
@@ -607,7 +701,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				}
 				applyRequestScopedActionToResult(action, okAction, &result)
 				m.recordExecutionResult(ctx, result, auth, ephemeralResult)
-				discardStreamChunks(streamResult.Chunks)
+				discardStreamChunks(ctx, streamResult.Chunks)
 				if isRequestScopedStop(action, okAction) {
 					return nil, wrapRequestStopError(bootstrapErr)
 				}
@@ -626,7 +720,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					result.CredentialScope = true
 				}
 				m.recordExecutionResult(ctx, result, auth, ephemeralResult)
-				discardStreamChunks(streamResult.Chunks)
+				discardStreamChunks(ctx, streamResult.Chunks)
 				return nil, bootstrapErr
 			}
 			if idx < len(execModels)-1 {
@@ -638,7 +732,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					result.CredentialScope = true
 				}
 				m.recordExecutionResult(ctx, result, auth, ephemeralResult)
-				discardStreamChunks(streamResult.Chunks)
+				discardStreamChunks(ctx, streamResult.Chunks)
 				lastErr = bootstrapErr
 				if result.CredentialScope {
 					return nil, newStreamBootstrapError(bootstrapErr, streamResult.Headers)
@@ -653,7 +747,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				result.CredentialScope = true
 			}
 			m.recordExecutionResult(ctx, result, auth, ephemeralResult)
-			discardStreamChunks(streamResult.Chunks)
+			discardStreamChunks(ctx, streamResult.Chunks)
 			return nil, newStreamBootstrapError(bootstrapErr, streamResult.Headers)
 		}
 
@@ -675,7 +769,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			warnLogUpstreamFailure(ctx, entry, provider, execModel, auth, time.Since(startStream), emptyErr)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: emptyErr, Options: execOpts}
 			m.recordExecutionResult(ctx, result, auth, ephemeralResult)
-			discardStreamChunks(streamResult.Chunks)
+			discardStreamChunks(ctx, streamResult.Chunks)
 			if idx < len(execModels)-1 {
 				lastErr = emptyErr
 				continue
@@ -687,7 +781,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 
 		remaining := streamResult.Chunks
 		if closed {
-			discardStreamChunks(streamResult.Chunks)
+			discardStreamChunks(ctx, streamResult.Chunks)
 			closedCh := make(chan cliproxyexecutor.StreamChunk)
 			close(closedCh)
 			remaining = closedCh

@@ -19,6 +19,13 @@ func EmptyCompletionError() error {
 	return errEmptyCompletion
 }
 
+// EmptyCountError returns the retriable error used when upstream returns an
+// empty count-tokens response. The plugin-executor path returns it so count
+// failures use the same code as the conductor's count path.
+func EmptyCountError() error {
+	return errEmptyCount
+}
+
 type choiceExtractionPayload struct {
 	N                *int `json:"n"`
 	CandidateCount   *int `json:"candidateCount"`
@@ -155,4 +162,73 @@ func (d *StreamBootstrapDetector) IsTerminalEmpty() bool {
 		return false
 	}
 	return d.state.isTerminalEmpty()
+}
+
+// RedactSecrets redacts credential-shaped values using the same recognition
+// set as conductor logging and *Error sanitization. Plugin stream wrappers
+// must apply it before emitting an error-path payload to a caller.
+func RedactSecrets(s string) string {
+	return redactSecretsForLog(s)
+}
+
+// SanitizeError redacts every exported string field of an *Error. It is the
+// exported form of sanitizeErrorTextFields so pluginhost uses the same
+// mechanism as wrapStreamResult rather than a second copy.
+func SanitizeError(err error) error {
+	return sanitizeErrorTextFields(err)
+}
+
+// StreamPayloadErrorDetector incrementally detects in-band provider errors in
+// stream bytes after bootstrap has already forwarded meaningful output.
+type StreamPayloadErrorDetector struct {
+	state streamPayloadErrorDetector
+}
+
+// Observe records a stream fragment and returns a sanitized in-band error
+// when one has been detected. A nil return is not a successful completion.
+func (d *StreamPayloadErrorDetector) Observe(payload []byte) error {
+	if d == nil {
+		return nil
+	}
+	if err := d.state.Observe(payload); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Finish flushes a trailing unterminated fragment and returns a sanitized
+// in-band error when one is present.
+func (d *StreamPayloadErrorDetector) Finish() error {
+	if d == nil {
+		return nil
+	}
+	if err := d.state.Finish(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// HasPending reports whether the detector is holding an incomplete frame (a
+// partial SSE line, a data line without a closing blank line, or an incomplete
+// JSON fragment). Callers can use this to avoid forwarding trailing fragments
+// that belong to a frame already in flight.
+func (d *StreamPayloadErrorDetector) HasPending() bool {
+	if d == nil {
+		return false
+	}
+	return d.state.HasPending()
+}
+
+// TakeFrame reports a completed frame from the most recent Observe/Finish call.
+// The returned error is non-nil when the completed frame was an in-band provider
+// error; the bool is true when a frame was consumed.
+func (d *StreamPayloadErrorDetector) TakeFrame() (error, bool) {
+	if d == nil {
+		return nil, false
+	}
+	err, ok := d.state.TakeFrame()
+	if err != nil {
+		return err, ok
+	}
+	return nil, ok
 }

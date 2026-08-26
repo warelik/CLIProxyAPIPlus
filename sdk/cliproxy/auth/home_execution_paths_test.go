@@ -52,7 +52,7 @@ func (*homeExecutionExecutor) ExecuteStream(context.Context, *Auth, cliproxyexec
 }
 func (*homeExecutionExecutor) Refresh(context.Context, *Auth) (*Auth, error) { return nil, nil }
 func (*homeExecutionExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	return cliproxyexecutor.Response{}, nil
+	return cliproxyexecutor.Response{Payload: []byte(`{"input_tokens":1}`)}, nil
 }
 func (*homeExecutionExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
 	return nil, nil
@@ -1582,5 +1582,153 @@ func TestHomePrepareFailureResultPreservesRequestMetadata(t *testing.T) {
 			assertHomeRequestMetadata(t, prepareMetadata, "priority")
 			assertHomeRequestMetadata(t, hook.awaitResult(t), "priority")
 		})
+	}
+}
+
+type freshHomeStreamSelectionDispatcher struct {
+	calls atomic.Int32
+}
+
+func (*freshHomeStreamSelectionDispatcher) HeartbeatOK() bool { return true }
+
+func (d *freshHomeStreamSelectionDispatcher) RPopAuth(ctx context.Context, model string, sessionID string, headers http.Header, count int) ([]byte, error) {
+	return d.RPopAuthWithConstraints(ctx, model, sessionID, headers, count, nil, "")
+}
+
+func (d *freshHomeStreamSelectionDispatcher) RPopAuthWithConstraints(_ context.Context, _ string, _ string, _ http.Header, _ int, excludedAuthIDs []string, _ string) ([]byte, error) {
+	d.calls.Add(1)
+	excluded := make(map[string]struct{}, len(excludedAuthIDs))
+	for _, authID := range excludedAuthIDs {
+		excluded[authID] = struct{}{}
+	}
+	for _, authID := range []string{"home-auth-a", "home-auth-b"} {
+		if _, okExcluded := excluded[authID]; okExcluded {
+			continue
+		}
+		return json.Marshal(homeAuthDispatchResponse{Auth: Auth{
+			ID:       authID,
+			Provider: "home-execution",
+			Status:   StatusActive,
+			Attributes: map[string]string{
+				AttributeAuthKind: AuthKindAPIKey,
+			},
+		}})
+	}
+	return nil, home.ErrAuthNotFound
+}
+
+func (*freshHomeStreamSelectionDispatcher) AbortAmbiguousDispatch() {}
+
+type emptyThenContentHomeExecutor struct {
+	mu      sync.Mutex
+	authIDs []string
+}
+
+func (*emptyThenContentHomeExecutor) Identifier() string { return "home-execution" }
+func (e *emptyThenContentHomeExecutor) Execute(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.mu.Lock()
+	e.authIDs = append(e.authIDs, auth.ID)
+	n := len(e.authIDs)
+	e.mu.Unlock()
+	if n == 1 {
+		return cliproxyexecutor.Response{Payload: []byte(`{"choices":[{"message":{"content":""},"finish_reason":"stop"}],"usage":{"completion_tokens":0}}`)}, nil
+	}
+	return cliproxyexecutor.Response{Payload: []byte(`{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}`)}, nil
+}
+func (*emptyThenContentHomeExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	return nil, nil
+}
+func (*emptyThenContentHomeExecutor) Refresh(context.Context, *Auth) (*Auth, error) { return nil, nil }
+func (*emptyThenContentHomeExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+func (*emptyThenContentHomeExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, nil
+}
+func (e *emptyThenContentHomeExecutor) AuthIDs() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string(nil), e.authIDs...)
+}
+
+func TestHomeExecuteEmptyCompletionRotatesAuth(t *testing.T) {
+	dispatcher := &freshHomeStreamSelectionDispatcher{}
+	manager := NewManager(nil, nil, nil)
+	manager.SetConfig(&internalconfig.Config{Home: internalconfig.HomeConfig{Enabled: true}})
+	manager.SetRetryConfig(0, time.Second, 2)
+	manager.PublishHomeDispatch(dispatcher, executionregistry.New(), 1)
+	executor := &emptyThenContentHomeExecutor{}
+	manager.RegisterExecutor(executor)
+
+	resp, errExecute := manager.Execute(context.Background(), []string{"home-execution"}, cliproxyexecutor.Request{Model: "model-a"}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	if !strings.Contains(string(resp.Payload), "ok") {
+		t.Fatalf("payload = %q, want content from the second Home auth", resp.Payload)
+	}
+	if got := executor.AuthIDs(); len(got) != 2 || got[0] != "home-auth-a" || got[1] != "home-auth-b" {
+		t.Fatalf("executor auth IDs = %v, want [home-auth-a home-auth-b]", got)
+	}
+	if got := dispatcher.calls.Load(); got != 2 {
+		t.Fatalf("Home RPOP calls = %d, want 2", got)
+	}
+}
+
+type emptyThenContentHomeCountExecutor struct {
+	mu      sync.Mutex
+	authIDs []string
+}
+
+func (*emptyThenContentHomeCountExecutor) Identifier() string { return "home-execution" }
+func (*emptyThenContentHomeCountExecutor) Execute(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+func (*emptyThenContentHomeCountExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	return nil, nil
+}
+func (*emptyThenContentHomeCountExecutor) Refresh(context.Context, *Auth) (*Auth, error) {
+	return nil, nil
+}
+func (e *emptyThenContentHomeCountExecutor) CountTokens(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.mu.Lock()
+	e.authIDs = append(e.authIDs, auth.ID)
+	n := len(e.authIDs)
+	e.mu.Unlock()
+	if n == 1 {
+		return cliproxyexecutor.Response{Payload: []byte(`   `)}, nil
+	}
+	return cliproxyexecutor.Response{Payload: []byte(`{"input_tokens":1}`)}, nil
+}
+func (*emptyThenContentHomeCountExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, nil
+}
+func (e *emptyThenContentHomeCountExecutor) AuthIDs() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string(nil), e.authIDs...)
+}
+
+func TestHomeCountEmptyBodyRotatesAuth(t *testing.T) {
+	dispatcher := &freshHomeStreamSelectionDispatcher{}
+	manager := NewManager(nil, nil, nil)
+	manager.SetConfig(&internalconfig.Config{Home: internalconfig.HomeConfig{Enabled: true}})
+	manager.SetRetryConfig(0, time.Second, 2)
+	manager.PublishHomeDispatch(dispatcher, executionregistry.New(), 1)
+	executor := &emptyThenContentHomeCountExecutor{}
+	manager.RegisterExecutor(executor)
+
+	resp, errCount := manager.ExecuteCount(context.Background(), []string{"home-execution"}, cliproxyexecutor.Request{Model: "model-a"}, cliproxyexecutor.Options{})
+	if errCount != nil {
+		t.Fatalf("ExecuteCount() error = %v", errCount)
+	}
+	if !strings.Contains(string(resp.Payload), "input_tokens") {
+		t.Fatalf("payload = %q, want count from the second Home auth", resp.Payload)
+	}
+	if got := executor.AuthIDs(); len(got) != 2 || got[0] != "home-auth-a" || got[1] != "home-auth-b" {
+		t.Fatalf("executor auth IDs = %v, want [home-auth-a home-auth-b]", got)
+	}
+	if got := dispatcher.calls.Load(); got != 2 {
+		t.Fatalf("Home RPOP calls = %d, want 2", got)
 	}
 }
