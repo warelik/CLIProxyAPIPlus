@@ -1,9 +1,11 @@
 package pluginhost
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -116,9 +118,41 @@ func (h *Host) ExecutePluginExecutorStream(ctx context.Context, pluginID string,
 // instead of a clean stream end, mirroring the conductor's aggregate-at-close
 // judgment. Recognized protocol framing is buffered only until meaningful output
 // appears or the stream closes; unrecognized streams remain pass-through.
+
+// isStreamFrameLike reports whether payload may belong to an SSE or JSONL stream
+// frame. It is a fast, stateless pre-filter for the pass-through path: payloads
+// that do not look frameable are forwarded immediately instead of being held
+// until a frame boundary arrives.
+func isStreamFrameLike(payload []byte) bool {
+	trimmed := bytes.TrimSpace(payload)
+	if len(trimmed) == 0 {
+		return false
+	}
+	if bytes.HasPrefix(trimmed, []byte("data:")) ||
+		bytes.HasPrefix(trimmed, []byte("event:")) ||
+		bytes.HasPrefix(trimmed, []byte("id:")) ||
+		bytes.HasPrefix(trimmed, []byte("retry:")) ||
+		bytes.HasPrefix(trimmed, []byte(":")) ||
+		bytes.Equal(trimmed, []byte("[DONE]")) {
+		return true
+	}
+	return trimmed[0] == '{' || trimmed[0] == '['
+}
+
 func wrapStreamEmptyCompletion(ctx context.Context, streamResult *coreexecutor.StreamResult, requestPayloads ...[]byte) *coreexecutor.StreamResult {
 	if streamResult == nil || streamResult.Chunks == nil {
-		return streamResult
+		errChunks := make(chan coreexecutor.StreamChunk, 1)
+		errChunks <- coreexecutor.StreamChunk{Err: &coreauth.Error{
+			Code:      "empty_stream",
+			Message:   "upstream stream has no source",
+			Retryable: true,
+		}}
+		close(errChunks)
+		wrapped := &coreexecutor.StreamResult{Chunks: errChunks}
+		if streamResult != nil {
+			wrapped.Headers = streamResult.Headers
+		}
+		return wrapped
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -136,13 +170,82 @@ func wrapStreamEmptyCompletion(ctx context.Context, streamResult *coreexecutor.S
 			}
 		}
 		forwarding := false
-		forward := func(chunk coreexecutor.StreamChunk) bool {
+		var payloadErrors coreauth.StreamPayloadErrorDetector
+		var frameBuffer []coreexecutor.StreamChunk
+		frameBytes := 0
+		redactAllFrames := false
+
+		send := func(chunk coreexecutor.StreamChunk) bool {
 			select {
 			case <-ctx.Done():
 				return false
 			case wrapped <- chunk:
 				return true
 			}
+		}
+
+		flushFrame := func(asError bool) bool {
+			if len(frameBuffer) == 0 {
+				return true
+			}
+			if asError {
+				joined := make([]byte, 0, frameBytes)
+				for _, c := range frameBuffer {
+					joined = append(joined, c.Payload...)
+				}
+				frameBuffer = nil
+				frameBytes = 0
+				return send(coreexecutor.StreamChunk{Payload: []byte(coreauth.RedactSecrets(string(joined)))})
+			}
+			for _, c := range frameBuffer {
+				if !send(c) {
+					return false
+				}
+			}
+			frameBuffer = nil
+			frameBytes = 0
+			return true
+		}
+
+		forward := func(chunk coreexecutor.StreamChunk) bool {
+			if chunk.Err != nil {
+				chunk.Err = coreauth.SanitizeError(chunk.Err)
+				if !flushFrame(true) {
+					return false
+				}
+				if redactAllFrames {
+					chunk.Payload = []byte(coreauth.RedactSecrets(string(chunk.Payload)))
+				}
+				return send(chunk)
+			}
+			if len(chunk.Payload) == 0 {
+				if redactAllFrames {
+					return true
+				}
+				return send(chunk)
+			}
+			if detector.StreamError() != nil {
+				redactAllFrames = true
+			}
+			if !redactAllFrames && !isStreamFrameLike(chunk.Payload) && !payloadErrors.HasPending() {
+				return send(chunk)
+			}
+			_ = payloadErrors.Observe(chunk.Payload)
+			frameBuffer = append(frameBuffer, chunk)
+			frameBytes += len(chunk.Payload)
+			for {
+				frameErr, ok := payloadErrors.TakeFrame()
+				if !ok {
+					break
+				}
+				if frameErr != nil {
+					redactAllFrames = true
+				}
+				if !flushFrame(redactAllFrames || frameErr != nil) {
+					return false
+				}
+			}
+			return true
 		}
 		flush := func() bool {
 			for _, chunk := range buffered {
@@ -197,6 +300,19 @@ func wrapStreamEmptyCompletion(ctx context.Context, streamResult *coreexecutor.S
 					}
 				}
 				_ = flush()
+				_ = payloadErrors.Finish()
+				for {
+					frameErr, ok := payloadErrors.TakeFrame()
+					if !ok {
+						break
+					}
+					if frameErr != nil {
+						redactAllFrames = true
+					}
+					if !flushFrame(redactAllFrames || frameErr != nil) {
+						return
+					}
+				}
 				return
 			}
 			if forwarding {
@@ -228,12 +344,12 @@ func wrapStreamEmptyCompletion(ctx context.Context, streamResult *coreexecutor.S
 				}
 			}
 			if streamErr := detector.StreamError(); streamErr != nil {
-				discardStreamChunks(src)
+				discardStreamChunks(ctx, src)
 				_ = forward(coreexecutor.StreamChunk{Err: streamErr})
 				return
 			}
 			if detector.IsTerminalEmpty() {
-				discardStreamChunks(src)
+				discardStreamChunks(ctx, src)
 				_ = forward(coreexecutor.StreamChunk{Err: coreauth.EmptyCompletionError()})
 				return
 			}
@@ -242,14 +358,42 @@ func wrapStreamEmptyCompletion(ctx context.Context, streamResult *coreexecutor.S
 	return &coreexecutor.StreamResult{Chunks: wrapped, Headers: streamResult.Headers}
 }
 
-func discardStreamChunks(ch <-chan coreexecutor.StreamChunk) {
+var streamDrainTimeout = 5 * time.Second
+
+func discardStreamChunks(ctx context.Context, ch <-chan coreexecutor.StreamChunk) <-chan struct{} {
+	done := make(chan struct{})
 	if ch == nil {
-		return
+		close(done)
+		return done
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	go func() {
-		for range ch {
+		defer close(done)
+		timer := time.NewTimer(streamDrainTimeout)
+		defer timer.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
+				return
+			case _, ok := <-ch:
+				if !ok {
+					return
+				}
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(streamDrainTimeout)
+			}
 		}
 	}()
+	return done
 }
 
 func streamChunkPayload(chunks []coreexecutor.StreamChunk) []byte {
@@ -266,7 +410,14 @@ func (h *Host) CountPluginExecutor(ctx context.Context, pluginID string, req cor
 	if errAdapter != nil {
 		return coreexecutor.Response{}, errAdapter
 	}
-	return adapter.CountTokens(ctx, (*coreauth.Auth)(nil), req, opts)
+	resp, err := adapter.CountTokens(ctx, (*coreauth.Auth)(nil), req, opts)
+	if err != nil {
+		return coreexecutor.Response{}, err
+	}
+	if coreauth.IsEmptyCompletionPayload(resp.Payload) {
+		return coreexecutor.Response{}, coreauth.EmptyCountError()
+	}
+	return resp, nil
 }
 
 func (h *Host) executorAdapterForPlugin(pluginID string) (*executorAdapter, error) {

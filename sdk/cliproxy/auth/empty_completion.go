@@ -70,6 +70,16 @@ var errEmptyCompletion = &Error{
 	HTTPStatus: http.StatusServiceUnavailable,
 }
 
+// errEmptyCount indicates the upstream returned an empty count response. It is
+// retriable so the conductor marks the auth as failed, cools it down, and
+// rotates to the next auth/model.
+var errEmptyCount = &Error{
+	Code:       "empty_count",
+	Message:    "upstream returned an empty count response",
+	Retryable:  true,
+	HTTPStatus: http.StatusServiceUnavailable,
+}
+
 // maxStreamBootstrapBytes bounds how much metadata a stream can accumulate
 // before the conductor conservatively forwards it. Empty-completion detection
 // must never create an unbounded pre-output buffer.
@@ -2105,7 +2115,9 @@ func parseStreamErrorFromEnvelope(data []byte, envelope streamErrorEnvelope) *Er
 		err.Retryable = true
 	}
 
-	return err
+	// Sanitize every text field before the parsed upstream error reaches
+	// logging, result recording, or the output stream.
+	return sanitizeErrorTextFields(err).(*Error)
 }
 
 func evalProviderError(data []byte, sseEvent string) *Error {
@@ -2147,6 +2159,8 @@ type streamPayloadErrorDetector struct {
 	dataLines    [][]byte
 	currentEvent string
 	err          *Error
+	frameErrs    []*Error
+	frameRead    int
 }
 
 func (d *streamPayloadErrorDetector) Observe(chunk []byte) *Error {
@@ -2166,8 +2180,7 @@ func (d *streamPayloadErrorDetector) Observe(chunk []byte) *Error {
 		d.pending = d.pending[newline+1:]
 		if len(line) == 0 {
 			if len(d.dataLines) > 0 && classifyJSONBuffer(bytes.Join(d.dataLines, []byte("\n"))) == jsonBufIncomplete {
-				// Blank line inside a pretty-printed raw JSON frame: keep buffering
-				// the frame so the closing line is appended before evaluation.
+				d.dataLines = append(d.dataLines, []byte(""))
 				continue
 			}
 			d.flushData()
@@ -2188,10 +2201,12 @@ func (d *streamPayloadErrorDetector) Observe(chunk []byte) *Error {
 				for _, v := range values {
 					if streamErr := evalProviderError(v, ""); streamErr != nil {
 						d.err = streamErr
+						d.recordFrame()
 						d.pending = d.pending[:0]
 						return d.err
 					}
 				}
+				d.recordFrame()
 				d.pending = d.pending[:0]
 			}
 		}
@@ -2222,7 +2237,8 @@ func (d *streamPayloadErrorDetector) processLine(line []byte) {
 	default:
 		// Mirror of the bootstrap detector: a pretty-printed raw JSON frame must
 		// append the closing line first, then classify the joined buffer, and
-		// evaluate immediately when it becomes complete.
+		// evaluate immediately when it becomes complete. Non-JSON lines are
+		// accumulated as well; flushData() treats the joined buffer as a frame.
 		if len(d.dataLines) > 0 {
 			d.dataLines = append(d.dataLines, line)
 			joined := bytes.Join(d.dataLines, []byte("\n"))
@@ -2233,12 +2249,16 @@ func (d *streamPayloadErrorDetector) processLine(line []byte) {
 			case jsonBufIncomplete:
 				// Still incomplete; restore and wait for the next line.
 				d.dataLines = [][]byte{joined}
+			default:
+				d.dataLines = [][]byte{joined}
 			}
 			return
 		}
 		if classifyJSONBuffer(line) == jsonBufComplete {
 			d.evalCompleteJSONLine(line)
+			return
 		}
+		d.dataLines = append(d.dataLines, line)
 	}
 }
 
@@ -2247,15 +2267,20 @@ func (d *streamPayloadErrorDetector) evalCompleteJSONLine(line []byte) {
 	if err != nil {
 		if streamErr := evalProviderError(line, ""); streamErr != nil {
 			d.err = streamErr
+			d.recordFrame()
+			return
 		}
+		d.recordFrame()
 		return
 	}
 	for _, v := range values {
 		if streamErr := evalProviderError(v, ""); streamErr != nil {
 			d.err = streamErr
+			d.recordFrame()
 			return
 		}
 	}
+	d.recordFrame()
 }
 
 func (d *streamPayloadErrorDetector) flushData() {
@@ -2267,6 +2292,7 @@ func (d *streamPayloadErrorDetector) flushData() {
 	d.dataLines = nil
 	d.currentEvent = ""
 	if bytes.Equal(data, []byte("[DONE]")) {
+		d.recordFrame()
 		return
 	}
 	if len(data) == 0 {
@@ -2275,6 +2301,31 @@ func (d *streamPayloadErrorDetector) flushData() {
 	if err := evalProviderError(data, currentEvent); err != nil {
 		d.err = err
 	}
+	d.recordFrame()
+}
+
+func (d *streamPayloadErrorDetector) HasPending() bool {
+	if d == nil {
+		return false
+	}
+	return len(d.pending) > 0 || len(d.dataLines) > 0
+}
+
+func (d *streamPayloadErrorDetector) recordFrame() {
+	d.frameErrs = append(d.frameErrs, d.err)
+}
+
+func (d *streamPayloadErrorDetector) TakeFrame() (*Error, bool) {
+	if d.frameRead >= len(d.frameErrs) {
+		return nil, false
+	}
+	err := d.frameErrs[d.frameRead]
+	d.frameRead++
+	if d.frameRead == len(d.frameErrs) {
+		d.frameErrs = nil
+		d.frameRead = 0
+	}
+	return err, true
 }
 
 func (d *streamPayloadErrorDetector) Finish() *Error {
@@ -2290,9 +2341,11 @@ func (d *streamPayloadErrorDetector) Finish() *Error {
 					for _, v := range values {
 						if err := evalProviderError(v, ""); err != nil {
 							d.err = err
+							d.recordFrame()
 							return d.err
 						}
 					}
+					d.recordFrame()
 				}
 			} else {
 				d.processLine(trimmed)
@@ -2558,4 +2611,14 @@ func (m *Manager) markEmptyCompletion(ctx context.Context, result *Result) error
 	result.Error = errEmptyCompletion
 	m.MarkResult(ctx, *result)
 	return errEmptyCompletion
+}
+
+// markEmptyCount records a failed retriable empty count-tokens result and
+// returns the error to propagate. It is the count analogue of markEmptyCompletion
+// and uses errEmptyCount so count failures have a consistent code everywhere.
+func (m *Manager) markEmptyCount(ctx context.Context, result *Result) error {
+	result.Success = false
+	result.Error = errEmptyCount
+	m.MarkResult(ctx, *result)
+	return errEmptyCount
 }

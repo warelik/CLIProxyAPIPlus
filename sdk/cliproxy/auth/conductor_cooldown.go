@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"reflect"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -19,6 +20,19 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
+
+func laterTime(a, b time.Time) time.Time {
+	if a.IsZero() {
+		return b
+	}
+	if b.IsZero() {
+		return a
+	}
+	if a.After(b) {
+		return a
+	}
+	return b
+}
 
 var quotaCooldownDisabled atomic.Bool
 
@@ -886,34 +900,40 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							state.NextRetryAfter = time.Time{}
 						} else {
 							next := now.Add(30 * time.Minute)
-							state.NextRetryAfter = next
-							state.Quota = QuotaState{
-								Exceeded:      true,
-								Reason:        "credential_quota",
-								NextRecoverAt: next,
+							state.NextRetryAfter = laterTime(state.NextRetryAfter, next)
+							if !(state.Quota.Exceeded && state.Quota.NextRecoverAt.After(next)) {
+								state.Quota = QuotaState{
+									Exceeded:      true,
+									Reason:        "credential_quota",
+									NextRecoverAt: next,
+								}
 							}
 							for _, otherState := range auth.ModelStates {
 								if otherState != nil && otherState != state {
 									otherState.Unavailable = true
 									otherState.Status = StatusError
 									otherState.StatusMessage = "invalid_api_key"
-									otherState.NextRetryAfter = next
-									otherState.Quota = QuotaState{
-										Exceeded:      true,
-										Reason:        "credential_quota",
-										NextRecoverAt: next,
+									otherState.NextRetryAfter = laterTime(otherState.NextRetryAfter, next)
+									if !(otherState.Quota.Exceeded && otherState.Quota.NextRecoverAt.After(next)) {
+										otherState.Quota = QuotaState{
+											Exceeded:      true,
+											Reason:        "credential_quota",
+											NextRecoverAt: next,
+										}
 									}
 								}
 							}
 							auth.Unavailable = true
 							auth.Status = StatusError
 							auth.StatusMessage = "invalid_api_key"
-							auth.Quota = QuotaState{
-								Exceeded:      true,
-								Reason:        "credential_quota",
-								NextRecoverAt: next,
+							if !(auth.Quota.Exceeded && auth.Quota.NextRecoverAt.After(next)) {
+								auth.Quota = QuotaState{
+									Exceeded:      true,
+									Reason:        "credential_quota",
+									NextRecoverAt: next,
+								}
 							}
-							auth.NextRetryAfter = next
+							auth.NextRetryAfter = laterTime(auth.NextRetryAfter, next)
 							suspendReason = "invalid_api_key"
 							shouldSuspendModel = true
 						}
@@ -1514,7 +1534,39 @@ func resultErrorFromError(err error) *Error {
 			resultErr.Code = connectionLifecycleErrorCode
 		}
 	}
-	return resultErr
+	// Do not persist or propagate credentials that may be echoed in an
+	// in-band stream error. sanitizeErrorTextFields redacts every string
+	// field of the cloned result while the classification above already used
+	// the original err.
+	return sanitizeErrorTextFields(resultErr).(*Error)
+}
+
+// sanitizeErrorTextFields redacts secrets from every exported string field of the
+// inner *Error. It mutates the value in place when err is an *Error (or wraps
+// one), preserving the original error pointer so callers that compare identity
+// still work. All untrusted upstream error parsing should return through this.
+func sanitizeErrorTextFields(err error) error {
+	if err == nil {
+		return nil
+	}
+	var authErr *Error
+	if !errors.As(err, &authErr) || authErr == nil {
+		return err
+	}
+	v := reflect.ValueOf(authErr).Elem()
+	t := v.Type()
+	for i := 0; i < v.NumField(); i++ {
+		field := t.Field(i)
+		if !field.IsExported() {
+			continue
+		}
+		fv := v.Field(i)
+		if fv.Kind() == reflect.String {
+			s := fv.String()
+			fv.SetString(redactSecretsForLog(s))
+		}
+	}
+	return err
 }
 
 // shouldSkipCredentialCooldown reports failures that must not mark auth/model cooling.
@@ -1620,7 +1672,7 @@ func refreshErrorFromError(err error) *Error {
 		authErr.Code = "unauthorized"
 		authErr.Retryable = false
 	}
-	return authErr
+	return sanitizeErrorTextFields(authErr).(*Error)
 }
 
 func retryAfterFromError(err error) *time.Duration {

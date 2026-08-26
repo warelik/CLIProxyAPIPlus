@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -195,14 +196,28 @@ func TestWrapStreamEmptyCompletionPreservesContentBeforeUpstreamError(t *testing
 	}
 }
 
-func TestWrapStreamEmptyCompletionPreservesNilResults(t *testing.T) {
-	if got := wrapStreamEmptyCompletion(context.Background(), nil); got != nil {
-		t.Fatalf("wrapStreamEmptyCompletion(nil) = %#v, want nil", got)
-	}
-
-	result := &coreexecutor.StreamResult{Headers: http.Header{"X-Test": []string{"value"}}}
-	if got := wrapStreamEmptyCompletion(context.Background(), result); got != result {
-		t.Fatalf("wrapStreamEmptyCompletion(nil chunks) = %#v, want original result", got)
+func TestWrapStreamEmptyCompletionRejectsNilSource(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		result *coreexecutor.StreamResult
+	}{
+		{"nil result", nil},
+		{"nil chunks", &coreexecutor.StreamResult{Headers: http.Header{"X-Test": []string{"value"}}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := wrapStreamEmptyCompletion(context.Background(), tc.result)
+			if got == nil || got.Chunks == nil {
+				t.Fatalf("wrapStreamEmptyCompletion(%s) = %#v, want stream with error chunk", tc.name, got)
+			}
+			chunk, ok := <-got.Chunks
+			if !ok || chunk.Err == nil {
+				t.Fatalf("wrapStreamEmptyCompletion(%s) emitted chunk %v, want error", tc.name, chunk)
+			}
+			var authErr *coreauth.Error
+			if !errors.As(chunk.Err, &authErr) || authErr.Code != "empty_stream" || !authErr.Retryable {
+				t.Fatalf("error = %v, want retriable empty_stream", chunk.Err)
+			}
+		})
 	}
 }
 
@@ -333,5 +348,92 @@ func TestWrapStreamEmptyCompletionDrainsSourceAfterTerminalEmpty(t *testing.T) {
 		// Success: producer unblocked because src was drained
 	case <-time.After(time.Second):
 		t.Fatal("producer remained blocked after terminal empty return; source was not drained")
+	}
+}
+
+func TestDiscardStreamChunksExitsOnContextCancel(t *testing.T) {
+	src := make(chan coreexecutor.StreamChunk)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := discardStreamChunks(ctx, src)
+
+	select {
+	case <-done:
+		t.Fatal("drain finished too early")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("discardStreamChunks goroutine did not exit on context cancellation")
+	}
+}
+
+func TestDiscardStreamChunksExitsOnOpenUnclosedChannel(t *testing.T) {
+	previous := streamDrainTimeout
+	streamDrainTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { streamDrainTimeout = previous })
+
+	src := make(chan coreexecutor.StreamChunk)
+	done := discardStreamChunks(context.Background(), src)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("discardStreamChunks goroutine did not exit on timeout for open unclosed channel")
+	}
+}
+
+func TestWrapStreamEmptyCompletionRedactsInBandErrorPayload(t *testing.T) {
+	const secret = "sk-live-plugin-secret"
+	src := make(chan coreexecutor.StreamChunk, 2)
+	src <- coreexecutor.StreamChunk{Payload: []byte("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n\n")}
+	src <- coreexecutor.StreamChunk{Payload: []byte(`data: {"error":{"message":"Incorrect API key provided: ` + secret + `","type":"invalid_request_error"}}` + "\n\n")}
+	close(src)
+
+	wrapped := wrapStreamEmptyCompletion(context.Background(), &coreexecutor.StreamResult{Chunks: src})
+	var payloads []string
+	for chunk := range wrapped.Chunks {
+		if len(chunk.Payload) > 0 {
+			payloads = append(payloads, string(chunk.Payload))
+		}
+	}
+	joined := strings.Join(payloads, "")
+	if strings.Contains(joined, secret) {
+		t.Fatalf("plugin stream payload leaks in-band credential: %q", joined)
+	}
+	if !strings.Contains(joined, "hello") {
+		t.Fatalf("meaningful content was dropped: %q", joined)
+	}
+	if !strings.Contains(joined, "REDACTED") {
+		t.Fatalf("in-band error payload was not redacted: %q", joined)
+	}
+}
+
+func TestWrapStreamEmptyCompletionRedactsSplitInBandErrorPayload(t *testing.T) {
+	const secret = "sk-live-split-plugin-secret"
+	src := make(chan coreexecutor.StreamChunk, 3)
+	src <- coreexecutor.StreamChunk{Payload: []byte("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n\n")}
+	src <- coreexecutor.StreamChunk{Payload: []byte(`data: {"error":{"message":"Incorrect API key provided: ` + secret[:3])}
+	src <- coreexecutor.StreamChunk{Payload: []byte(secret[3:] + `","type":"invalid_request_error"}}` + "\n\n")}
+	close(src)
+
+	wrapped := wrapStreamEmptyCompletion(context.Background(), &coreexecutor.StreamResult{Chunks: src})
+	var payloads []string
+	for chunk := range wrapped.Chunks {
+		if len(chunk.Payload) > 0 {
+			payloads = append(payloads, string(chunk.Payload))
+		}
+	}
+	joined := strings.Join(payloads, "")
+	if strings.Contains(joined, secret) {
+		t.Fatalf("plugin stream payload leaks split in-band credential: %q", joined)
+	}
+	if !strings.Contains(joined, "hello") {
+		t.Fatalf("meaningful content was dropped: %q", joined)
+	}
+	if !strings.Contains(joined, "REDACTED") {
+		t.Fatalf("split in-band error payload was not redacted: %q", joined)
 	}
 }
